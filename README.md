@@ -1,25 +1,52 @@
-# Nezha Agent
-  
-Agent of Nezha Monitoring
+# 哪吒监控 Agent(精简改造版)
 
-## Contributors
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-<!--GAMFC_DELIMITER--><a href="https://github.com/naiba" title="naiba"><img src="https://avatars.githubusercontent.com/u/29243953?v=4" width="50;" alt="naiba"/></a>
-<a href="https://github.com/uubulb" title="UUBulb"><img src="https://avatars.githubusercontent.com/u/35923940?v=4" width="50;" alt="UUBulb"/></a>
-<a href="https://github.com/funnyzak" title="Leon"><img src="https://avatars.githubusercontent.com/u/2562087?v=4" width="50;" alt="Leon"/></a>
-<a href="https://github.com/zhangnew" title="zhangnew"><img src="https://avatars.githubusercontent.com/u/9146834?v=4" width="50;" alt="zhangnew"/></a>
-<a href="https://github.com/AEnjoy" title="AEnjoy"><img src="https://avatars.githubusercontent.com/u/37976919?v=4" width="50;" alt="AEnjoy"/></a>
-<a href="https://github.com/wwng2333" title=":D"><img src="https://avatars.githubusercontent.com/u/17147265?v=4" width="50;" alt=":D"/></a>
-<a href="https://github.com/DarcJC" title="Darc Z."><img src="https://avatars.githubusercontent.com/u/53445798?v=4" width="50;" alt="Darc Z."/></a>
-<a href="https://github.com/geniucker-dev" title="Geniucker Zhu"><img src="https://avatars.githubusercontent.com/u/165345526?v=4" width="50;" alt="Geniucker Zhu"/></a>
-<a href="https://github.com/ChrisKimZHT" title="Haotian Zou"><img src="https://avatars.githubusercontent.com/u/49368462?v=4" width="50;" alt="Haotian Zou"/></a>
-<a href="https://github.com/yuanweize" title="IYUANWEIZE"><img src="https://avatars.githubusercontent.com/u/30067203?v=4" width="50;" alt="IYUANWEIZE"/></a>
-<a href="https://github.com/NewbieOrange" title="NewbieOrange"><img src="https://avatars.githubusercontent.com/u/7200314?v=4" width="50;" alt="NewbieOrange"/></a>
-<a href="https://github.com/pexcn" title="Sing Yu Chan"><img src="https://avatars.githubusercontent.com/u/4590439?v=4" width="50;" alt="Sing Yu Chan"/></a>
-<a href="https://github.com/elysia-best" title="Yinan Qin"><img src="https://avatars.githubusercontent.com/u/39023210?v=4" width="50;" alt="Yinan Qin"/></a>
-<a href="https://github.com/xream" title="xream"><img src="https://avatars.githubusercontent.com/u/1210282?v=4" width="50;" alt="xream"/></a>
-<a href="https://github.com/xykt" title="xykt"><img src="https://avatars.githubusercontent.com/u/152045469?v=4" width="50;" alt="xykt"/></a>
-<a href="https://github.com/zhdsmy" title="zhdsmy"><img src="https://avatars.githubusercontent.com/u/8348149?v=4" width="50;" alt="zhdsmy"/></a>
-<a href="https://github.com/matchch" title="卖女孩的小火柴"><img src="https://avatars.githubusercontent.com/u/44471469?v=4" width="50;" alt="卖女孩的小火柴"/></a>
-<a href="https://github.com/liuran001" title="baka"><img src="https://avatars.githubusercontent.com/u/32791471?v=4" width="50;" alt="baka"/></a>
-<a href="https://github.com/akiasprin" title="葉鲜森(KEVI_)"><img src="https://avatars.githubusercontent.com/u/25278728?v=4" width="50;" alt="葉鲜森(KEVI_)"/></a><!--GAMFC_DELIMITER_END-->
+本项目基于 [哪吒监控 Agent nezhahq/agent](https://github.com/nezhahq/agent) 改造,移除了命令执行、Web 终端、文件管理、NAT 穿透、GPU/温度采集等远程管控能力,只保留**采集与上报**职责,收敛权限、缩小被滥用面。
+
+配合精简版面板 [wangdefaa/nezha](https://github.com/wangdefaa/nezha) 使用。
+
+## 采集内容
+
+- **系统**:CPU、内存、磁盘、负载、启动时间
+- **网络**:实时上下行、累计流量、TCP/UDP 连接数
+- **其它**:进程数、公网 IP / GeoIP
+- **主动拨测**:TCP、ICMP(Ping)、HTTP
+
+## 安装
+
+### Linux / macOS
+
+```bash
+env NZ_SERVER=面板IP:8008 NZ_CLIENT_SECRET=你的密钥 \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/wangdefaa/nezha-agent/main/script/install.sh)"
+```
+
+卸载:`sh install.sh uninstall`。
+
+### Windows(管理员 PowerShell)
+
+```powershell
+$env:NZ_SERVER="面板IP:8008"; $env:NZ_CLIENT_SECRET="你的密钥"
+iwr -useb https://raw.githubusercontent.com/wangdefaa/nezha-agent/main/script/install.ps1 | iex
+```
+
+### Docker
+
+见 [docker-compose.yaml](docker-compose.yaml)。Agent 采集宿主机指标,容器化需开启 host 网络与 PID 命名空间;完整宿主监控仍推荐用 install.sh 以 systemd 服务部署。
+
+## 配置与命令
+
+字段说明见 [config.yaml.example](config.yaml.example)。常用命令:
+
+| 命令 | 说明 |
+|---|---|
+| `nezha-agent -c config.yml` | 前台运行 |
+| `nezha-agent edit -c config.yml` | 交互式编辑配置 |
+| `nezha-agent service -c config.yml install` | 注册为系统服务(systemd / OpenRC / launchd) |
+| `nezha-agent service -c config.yml uninstall` | 卸载服务 |
+
+## 上游与许可
+
+- 基础项目:[哪吒监控 Agent nezhahq/agent](https://github.com/nezhahq/agent)
+- 许可证:[Apache-2.0](LICENSE)

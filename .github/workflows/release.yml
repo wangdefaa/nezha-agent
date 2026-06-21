@@ -1,4 +1,4 @@
-name: Build + Release
+name: Release
 
 on:
   push:
@@ -10,12 +10,14 @@ on:
       - ".github/workflows/agent.yml"
       - ".github/workflows/codeql-analysis.yml"
       - ".github/workflows/test.yml"
-      - ".github/workflows/contributors.yml"
       - "README.md"
       - ".goreleaser.yml"
   pull_request:
     branches:
       - main
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -110,19 +112,21 @@ jobs:
       - name: Checksum
         run: sha256sum ./assets/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
 
+      - name: Sign release assets
+        env:
+          AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
+        run: |
+          printf '%s' "$AGENT_SIGNING_KEY" > /tmp/agent-signing.key
+          for f in ./assets/*/*.zip; do
+            openssl dgst -sha256 -sign /tmp/agent-signing.key -out "$f.sig" "$f"
+          done
+          rm -f /tmp/agent-signing.key
+
       - name: Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             checksums.txt
             assets/*/*.zip
+            assets/*/*.sig
           generate_release_notes: true
-
-      - name: Trigger sync
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-          GH_DEBUG: api
-        run: |
-          gh workflow run sync-release.yml
-          gh workflow run sync-release-atomgit.yml

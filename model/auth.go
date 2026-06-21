@@ -6,11 +6,9 @@ import (
 )
 
 // AuthHandler attaches the agent's identity to every outbound gRPC call.
-// Credentials is a single closure returning a coherent (secret, uuid) pair so
-// a dashboard-initiated rotation (server transfer / ownership swap) cannot be
-// observed mid-swap as a torn (oldUUID, newSecret) pair. Each gRPC dial calls
-// Credentials once; a save-first-then-publish reload in the agent is enough
-// to switch credentials atomically.
+// Credentials is a single closure returning a coherent (secret, uuid) pair.
+// 运行期凭据不再轮转（配置热重载已移除），闭包直接读 agentConfig 即可；
+// 该接口仍保持「一次调用返回一对」的形态，以便日后需要时安全扩展。
 type AuthHandler struct {
 	Credentials func() (secret, uuid string)
 	// RequireTLS reports whether the agent's transport must be encrypted, read
@@ -22,7 +20,7 @@ type AuthHandler struct {
 
 // ErrAuthCredentialsNotConfigured surfaces from gRPC dial metadata when an
 // AuthHandler has been constructed without a Credentials closure (e.g. zero
-// value, or a refactor that forgot to wire publishCredentials). Returning an
+// value, or a refactor that forgot to wire the closure). Returning an
 // error instead of panicking keeps the gRPC client loop alive so the
 // supervisor can log and retry — a nil dereference would crash the agent
 // process and cause unattended hosts to flap.

@@ -74,20 +74,6 @@ func EditAgentConfig(configPath string, agentConfig *model.AgentConfig) {
 			},
 		},
 		{
-			Name: "gpu",
-			Prompt: &survey.Confirm{
-				Message: "是否启用 GPU 监控？",
-				Default: false,
-			},
-		},
-		{
-			Name: "temperature",
-			Prompt: &survey.Confirm{
-				Message: "是否启用温度监控？",
-				Default: false,
-			},
-		},
-		{
 			Name: "debug",
 			Prompt: &survey.Confirm{
 				Message: "是否开启调试模式？",
@@ -97,13 +83,11 @@ func EditAgentConfig(configPath string, agentConfig *model.AgentConfig) {
 	}
 
 	answers := struct {
-		Nic         []string `mapstructure:"nic_allowlist" json:"nic_allowlist"`
-		Disk        []string `mapstructure:"hard_drive_partition_allowlist" json:"hard_drive_partition_allowlist"`
-		DNS         string   `mapstructure:"dns" json:"dns"`
-		GPU         bool     `mapstructure:"gpu" json:"gpu"`
-		Temperature bool     `mapstructure:"temperature" json:"temperature"`
-		Debug       bool     `mapstructure:"debug" json:"debug"`
-		UUID        string   `mapstructure:"uuid" json:"uuid"`
+		Nic   []string `mapstructure:"nic_allowlist" json:"nic_allowlist"`
+		Disk  []string `mapstructure:"hard_drive_partition_allowlist" json:"hard_drive_partition_allowlist"`
+		DNS   string   `mapstructure:"dns" json:"dns"`
+		Debug bool     `mapstructure:"debug" json:"debug"`
+		UUID  string   `mapstructure:"uuid" json:"uuid"`
 	}{}
 
 	err = survey.Ask(qs, &answers, survey.WithValidator(survey.Required))
@@ -141,8 +125,6 @@ func EditAgentConfig(configPath string, agentConfig *model.AgentConfig) {
 		agentConfig.DNS = []string{}
 	}
 
-	agentConfig.GPU = answers.GPU
-	agentConfig.Temperature = answers.Temperature
 	agentConfig.Debug = answers.Debug
 	agentConfig.UUID = answers.UUID
 

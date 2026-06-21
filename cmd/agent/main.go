@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/nezhahq/go-github-selfupdate/selfupdate"
 	"github.com/nezhahq/service"
 	ping "github.com/prometheus-community/pro-bing"
 	utls "github.com/refraction-networking/utls"
@@ -35,12 +33,9 @@ import (
 
 	"github.com/nezhahq/agent/cmd/agent/commands"
 	"github.com/nezhahq/agent/model"
-	fm "github.com/nezhahq/agent/pkg/fm"
 	"github.com/nezhahq/agent/pkg/fsnotifyx"
 	"github.com/nezhahq/agent/pkg/logger"
 	"github.com/nezhahq/agent/pkg/monitor"
-	"github.com/nezhahq/agent/pkg/processgroup"
-	"github.com/nezhahq/agent/pkg/pty"
 	"github.com/nezhahq/agent/pkg/util"
 	utlsx "github.com/nezhahq/agent/pkg/utls"
 	pb "github.com/nezhahq/agent/proto"
@@ -62,27 +57,6 @@ var (
 	hostStatus atomic.Bool
 	ipStatus   atomic.Bool
 
-	// reloadMu guards reloadTimer. A non-nil reloadTimer means a delayed swap
-	// to a new agentConfig is queued. A second ApplyConfig task may arrive
-	// before the timer fires (e.g. the dashboard pushing a counter-task after
-	// the operator cancels a server transfer); we Stop() the previous timer
-	// and replace it so the most recent config wins instead of the agent
-	// committing a swap the dashboard already rolled back.
-	reloadMu         sync.Mutex
-	reloadTimer      *time.Timer
-	reloadIsTransfer bool
-
-	// liveCredentials holds an atomic snapshot of (ClientSecret, ClientUUID)
-	// that the gRPC AuthHandler closure reads on every dial. We can't have the
-	// closure read agentConfig.ClientSecret directly: applyPendingReload swaps
-	// agentConfig with `agentConfig = cfg` (a multi-field struct assignment),
-	// strings are two-word headers (pointer + length), and concurrent
-	// GetRequestMetadata calls from inflight gRPC ops would observe torn reads
-	// — at best the dashboard rejects the auth, at worst a torn string header
-	// dereferences foreign memory. Publishing through atomic.Pointer gives the
-	// auth path a coherent (secret, uuid) pair without taking a lock per call.
-	liveCredentials atomic.Pointer[agentCredentials]
-
 	dnsResolver = &net.Resolver{PreferGo: true}
 	httpClient  = &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -90,8 +64,6 @@ var (
 		},
 		Timeout: time.Second * 30,
 	}
-
-	reloadSigChan = make(chan struct{})
 )
 
 var (
@@ -108,39 +80,6 @@ const (
 
 	binaryName = "nezha-agent"
 )
-
-// agentCredentials is the atomic-snapshot type behind liveCredentials. We keep
-// it deliberately narrow — only the fields the gRPC AuthHandler reads — so
-// the rest of agentConfig (DNS, ReportDelay, debug toggles, ...) can keep
-// being read directly. Auth is the path where torn reads turn into
-// connection-level rejections or panics; other paths only see eventual
-// consistency.
-type agentCredentials struct {
-	ClientSecret string
-	ClientUUID   string
-}
-
-// publishCredentials atomically snapshots the credentials so concurrent
-// AuthHandler reads observe a coherent (secret, uuid) pair. Call this at
-// startup right after agentConfig.Read populates the on-disk values, and on
-// every applyPendingReload right before the in-process swap.
-func publishCredentials(cfg model.AgentConfig) {
-	liveCredentials.Store(&agentCredentials{
-		ClientSecret: cfg.ClientSecret,
-		ClientUUID:   cfg.UUID,
-	})
-}
-
-// loadCredentials returns the latest published snapshot, or a zero value if
-// publishCredentials hasn't been called yet. The AuthHandler closure uses
-// the zero fallback rather than a nil panic so an early reconnect during
-// startup degrades to "unauthenticated" instead of crashing the agent.
-func loadCredentials() agentCredentials {
-	if c := liveCredentials.Load(); c != nil {
-		return *c
-	}
-	return agentCredentials{}
-}
 
 func setEnv() {
 	resolver.SetDefaultScheme("passthrough")
@@ -283,21 +222,12 @@ func main() {
 }
 
 func run() {
-	// 把启动时 agentConfig 里的 credential 发布到 atomic 快照里 — 后续 reload
-	// 也会重新 publish，AuthHandler 闭包只读这个快照而不再裸读 agentConfig。
-	// 这是 applyPendingReload 与 gRPC 鉴权路径的并发协议起点。
-	publishCredentials(agentConfig)
-
-	// Read credentials at call time so a mid-session secret rotation (server
-	// transfer) flows into the next reconnect without rebuilding AuthHandler.
-	// 注意：闭包必须读 liveCredentials 快照，不能裸读 agentConfig.ClientSecret
-	// — 后者会与 applyPendingReload 的 `agentConfig = cfg` 结构体赋值形成
-	// data race（string 是两个 word，整体写不是原子的），TestAuthCredentialPublishConcurrentWithReadIsRaceFree
-	// 在 -race 下钉死该不变量。
+	// 配置热重载已移除，agentConfig 在 run() 启动前由 preRun 一次性读入，运行期
+	// 不再轮转。AuthHandler 闭包直接读 agentConfig.ClientSecret/UUID 即可——
+	// 没有并发写入方，不存在 torn read 问题。
 	auth := model.AuthHandler{
 		Credentials: func() (string, string) {
-			c := loadCredentials()
-			return c.ClientSecret, c.ClientUUID
+			return agentConfig.ClientSecret, agentConfig.UUID
 		},
 		RequireTLS: func() bool {
 			return agentConfig.TLS
@@ -396,21 +326,84 @@ func run() {
 		}
 		go reportStateDaemon(reportState, wCancel)
 
-		select {
-		case <-reloadSigChan:
-			println("Reloading...")
-			wCancel()
-		case <-wCtx.Done():
-			println("Worker exit...")
-		}
+		<-wCtx.Done()
+		println("Worker exit...")
 
 		retry()
 	}
 }
 
+// systemdScriptWithCapNetRaw 复刻 kardianos/service 默认 systemd 模板，仅在
+// [Service] 段额外加入 AmbientCapabilities=CAP_NET_RAW，使以 nezha 低权限用户
+// 运行的 agent 仍能执行 ICMP 拨测（raw socket 需要该 capability）。capability
+// 写入 unit 文件，自更新覆写二进制不会丢失。
+const systemdScriptWithCapNetRaw = `[Unit]
+Description={{.Description}}
+ConditionFileIsExecutable={{.Path|cmdEscape}}
+{{range $i, $dep := .Dependencies}}
+{{$dep}} {{end}}
+
+[Service]
+StartLimitInterval=5
+StartLimitBurst=10
+ExecStart={{.Path|cmdEscape}}{{range .Arguments}} {{.|cmd}}{{end}}
+{{if .ChRoot}}RootDirectory={{.ChRoot|cmd}}{{end}}
+{{if .WorkingDirectory}}WorkingDirectory={{.WorkingDirectory|cmdEscape}}{{end}}
+{{if .UserName}}User={{.UserName}}{{end}}
+AmbientCapabilities=CAP_NET_RAW
+{{if .ReloadSignal}}ExecReload=/bin/kill -{{.ReloadSignal}} "$MAINPID"{{end}}
+{{if .PIDFile}}PIDFile={{.PIDFile|cmd}}{{end}}
+{{if and .LogOutput .HasOutputFileSupport -}}
+StandardOutput=file:{{.LogDirectory}}/{{.Name}}.out
+StandardError=file:{{.LogDirectory}}/{{.Name}}.err
+{{- end}}
+{{if gt .LimitNOFILE -1 }}LimitNOFILE={{.LimitNOFILE}}{{end}}
+{{if .Restart}}Restart={{.Restart}}{{end}}
+{{if .SuccessExitStatus}}SuccessExitStatus={{.SuccessExitStatus}}{{end}}
+RestartSec=30
+EnvironmentFile=-/etc/sysconfig/{{.Name}}
+
+{{range $k, $v := .EnvVars -}}
+Environment={{$k}}={{$v}}
+{{end -}}
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// openRCScriptWithCapNetRaw 复刻 nezhahq/service 默认 OpenRC 模板，额外加入
+// command_user（以 nezha 低权限用户运行）与 capabilities="^cap_net_raw"（保留 ICMP
+// 拨测所需的 raw socket 能力，^ 前缀使其进入 ambient set 供子进程继承）。capability
+// 写入 service 脚本，自更新覆写二进制不会丢失。仅在使用 OpenRC 的发行版（如 Alpine）生效。
+const openRCScriptWithCapNetRaw = `#!/sbin/openrc-run
+supervisor=supervise-daemon
+name="{{.DisplayName}}"
+description="{{.Description}}"
+command={{.Path|cmdEscape}}
+{{- if .Arguments }}
+command_args="{{range .Arguments}}{{.}} {{end}}"
+{{- end }}
+name=$(basename $(readlink -f $command))
+{{if .WorkingDirectory}}directory="{{.WorkingDirectory}}"{{end}}
+{{if .UserName}}command_user="{{.UserName}}"{{end}}
+capabilities="^cap_net_raw"
+supervise_daemon_args="--stdout {{.LogDirectory}}/${name}.log --stderr {{.LogDirectory}}/${name}.err"
+
+{{range $k, $v := .EnvVars -}}
+export {{$k}}={{$v}}
+{{end -}}
+
+{{- if .Dependencies }}
+depend() {
+{{- range $i, $dep := .Dependencies}}
+{{"\t"}}{{$dep}}{{end}}
+}
+{{- end}}
+`
+
 func runService(action string, path string) {
-	winConfig := map[string]interface{}{
-		"OnFailure": "restart",
+	svcOption := map[string]interface{}{
+		"OnFailure": "restart", // Windows 服务失败重启
 	}
 
 	args := []string{"-c", path}
@@ -426,7 +419,17 @@ func runService(action string, path string) {
 		Arguments:        args,
 		Description:      "哪吒监控 Agent",
 		WorkingDirectory: filepath.Dir(executablePath),
-		Option:           winConfig,
+		Option:           svcOption,
+	}
+
+	// 仅 Linux：以 nezha 低权限用户运行服务。kardianos/service 会据此在
+	// systemd unit 写入 User=nezha。非 Linux 平台保持原行为（不设 UserName）。
+	if runtime.GOOS == "linux" {
+		svcConfig.UserName = "nezha"
+		// systemd 与 OpenRC 模板均注入 CAP_NET_RAW，使低权限 nezha 用户仍可执行 ICMP
+		// 拨测。service 库按机器实际 init 系统自动择一，无需在此探测。
+		svcOption["SystemdScript"] = systemdScriptWithCapNetRaw
+		svcOption["OpenRCScript"] = openRCScriptWithCapNetRaw
 	}
 
 	prg := &commands.Program{
@@ -455,6 +458,16 @@ func runService(action string, path string) {
 			log.Fatalf("init config failed: %v", err)
 		}
 		printf("Init system is: %s", initName)
+		// Linux 下在写入 systemd unit 前创建 nezha 用户，并把程序目录归属给
+		// nezha，使服务能以低权限运行的同时仍可自更新（覆盖写二进制）。
+		if runtime.GOOS == "linux" {
+			if err := ensureNezhaUser(); err != nil {
+				log.Fatalf("创建 nezha 用户失败: %v", err)
+			}
+			if err := chownAgentDir(); err != nil {
+				printf("chown 程序目录给 nezha 失败（自更新可能受影响）: %v", err)
+			}
+		}
 	}
 
 	if len(action) != 0 {
@@ -469,6 +482,64 @@ func runService(action string, path string) {
 	if err != nil {
 		logger.Error(err)
 	}
+}
+
+// ensureNezhaUser 仅 Linux。创建系统用户 nezha（无登录、无家目录），幂等。
+// install 需以 root 运行。优先用 GNU coreutils（useradd/groupadd，Debian/RHEL），
+// 不可用时回退到 busybox（addgroup/adduser，Alpine）。
+func ensureNezhaUser() error {
+	if _, err := user.Lookup("nezha"); err == nil {
+		return nil
+	}
+	shell := nologinShell()
+	if err := addNezhaUserGNU(shell); err == nil {
+		return nil
+	}
+	if err := addNezhaUserBusybox(shell); err != nil {
+		return fmt.Errorf("创建 nezha 用户失败（useradd 与 adduser 均不可用）: %v", err)
+	}
+	return nil
+}
+
+// addNezhaUserGNU 用 GNU coreutils 创建 nezha 用户/组（Debian/RHEL 等）。
+func addNezhaUserGNU(shell string) error {
+	if _, err := exec.LookPath("useradd"); err != nil {
+		return err
+	}
+	_ = exec.Command("groupadd", "--system", "nezha").Run() // 已存在则忽略
+	out, err := exec.Command("useradd", "--system", "-g", "nezha",
+		"-M", "-s", shell, "nezha").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("useradd nezha: %v: %s", err, out)
+	}
+	return nil
+}
+
+// addNezhaUserBusybox 用 busybox 创建 nezha 系统用户/组（Alpine）。
+func addNezhaUserBusybox(shell string) error {
+	_ = exec.Command("addgroup", "-S", "nezha").Run() // 已存在则忽略
+	out, err := exec.Command("adduser", "-S", "-D", "-H",
+		"-G", "nezha", "-s", shell, "nezha").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("adduser nezha: %v: %s", err, out)
+	}
+	return nil
+}
+
+// nologinShell 返回当前系统可用的 nologin shell 路径（含 Alpine 的 /bin/false 兜底）。
+func nologinShell() string {
+	for _, shell := range []string{"/usr/sbin/nologin", "/sbin/nologin", "/bin/false"} {
+		if _, err := os.Stat(shell); err == nil {
+			return shell
+		}
+	}
+	return "/sbin/nologin"
+}
+
+// chownAgentDir 把程序目录（含二进制与配置）归属 nezha，保留自更新写权限。
+func chownAgentDir() error {
+	dir := filepath.Dir(executablePath)
+	return exec.Command("chown", "-R", "nezha:nezha", dir).Run()
 }
 
 // newSerialTaskResultSender wraps the RequestTask stream's Send with a mutex.
@@ -501,21 +572,10 @@ func receiveTasksDaemon(tasks pb.NezhaService_RequestTaskClient, cancel context.
 	}
 }
 
-// dispatchAgentTask 决定 task 的执行调度：
-//   - TaskTypeApplyConfig / TaskTypeServerTransferApply 必须在 receive 循环
-//     里同步处理 — dashboard 的取消流程依赖「最后到达的 ApplyConfig 在 10s
-//     重载窗口内 supersede 上一条」，原先对所有 task 一律 `go func(t)` 会让
-//     两个 goroutine 抢 reloadMu 的顺序与到达顺序无关，反向调度时 agent 会
-//     把已取消的 credential 写盘锁死自己。两个 handler 都很短（JSON 解析 +
-//     ValidateConfig + 装计时器），不会拖慢其它任务接收。
-//   - 其它 task（HTTPGet/Ping/Command/Terminal/NAT/FM/...）继续 goroutine 派
-//     发：它们可能跑很久或永远不返回（流式 terminal/fm），不能阻塞接收循环。
+// dispatchAgentTask 一律以 goroutine 派发 task：拨测（HTTPGet/Ping）可能跑很久
+// 或永远不返回，不能阻塞接收循环。配置管理（ApplyConfig）原先需要同步处理的
+// 特殊路径已随热重载机制一并移除。
 func dispatchAgentTask(task *pb.Task, send func(*pb.TaskResult) error, cancel context.CancelFunc) {
-	switch task.GetType() {
-	case model.TaskTypeApplyConfig, model.TaskTypeServerTransferApply:
-		runAgentTask(task, send, cancel)
-		return
-	}
 	go runAgentTask(task, send, cancel)
 }
 
@@ -546,38 +606,8 @@ func doTask(task *pb.Task) *pb.TaskResult {
 		handleIcmpPingTask(task, &result)
 	case model.TaskTypeTCPPing:
 		handleTcpPingTask(task, &result)
-	case model.TaskTypeCommand:
-		handleCommandTask(task, &result)
 	case model.TaskTypeUpgrade:
 		handleUpgradeTask(task, &result)
-	case model.TaskTypeTerminalGRPC:
-		handleTerminalTask(task)
-		return nil
-	case model.TaskTypeNAT:
-		handleNATTask(task)
-		return nil
-	case model.TaskTypeFM:
-		handleFMTask(task)
-		return nil
-	case model.TaskTypeReportConfig:
-		handleReportConfigTask(&result)
-	case model.TaskTypeApplyConfig:
-		handleApplyConfigTask(task, &result)
-	case model.TaskTypeServerTransferApply:
-		handleServerTransferApplyTask(task, &result)
-	case model.TaskTypeExec:
-		handleExecTask(task, &result)
-	case model.TaskTypeFsList:
-		handleFsListTask(task, &result)
-	case model.TaskTypeFsRead:
-		handleFsReadTask(task, &result)
-	case model.TaskTypeFsWrite:
-		handleFsWriteTask(task, &result)
-	case model.TaskTypeFsDelete:
-		handleFsDeleteTask(task, &result)
-	case model.TaskTypeFsTransfer:
-		handleFsTransferTask(task)
-		return nil
 	case model.TaskTypeKeepalive:
 	default:
 		printf("不支持的任务: %v", task)
@@ -693,7 +723,7 @@ func doSelfUpdate(useLocalVersion bool) (exit bool) {
 			printf("failed to parse current version string: %v", err)
 			return
 		}
-		cmd := exec.Command(executablePath, "-v")
+		cmd := exec.Command(executablePath, "--version")
 		vb, err := cmd.Output()
 		if err != nil {
 			printf("failed to retrieve current executable version: %v", err)
@@ -754,57 +784,7 @@ func doSelfUpdate(useLocalVersion bool) (exit bool) {
 	}()
 
 	printf("检查更新: %v", v)
-	var latest *selfupdate.Release
-	switch {
-	case agentConfig.UseGiteeToUpgrade:
-		updater, erru := selfupdate.NewGiteeUpdater(selfupdate.Config{
-			BinaryName: binaryName,
-		})
-		if erru != nil {
-			printf("更新失败: %v", erru)
-			return
-		}
-		latest, err = updater.UpdateSelf(v, "naibahq/agent")
-	case agentConfig.UseAtomGitToUpgrade:
-		updater, erru := selfupdate.NewAtomGitUpdater(selfupdate.Config{
-			BinaryName: binaryName,
-		})
-		if erru != nil {
-			printf("更新失败: %v", erru)
-			return
-		}
-		latest, err = updater.UpdateSelf(v, "naiba/nezha-agent")
-	case monitor.CachedCountryCode == "cn":
-		if rand.Intn(2) == 0 {
-			updater, erru := selfupdate.NewGiteeUpdater(selfupdate.Config{
-				BinaryName: binaryName,
-			})
-			if erru != nil {
-				printf("更新失败: %v", erru)
-				return
-			}
-			latest, err = updater.UpdateSelf(v, "naibahq/agent")
-		} else {
-			updater, erru := selfupdate.NewAtomGitUpdater(selfupdate.Config{
-				BinaryName: binaryName,
-			})
-			if erru != nil {
-				printf("更新失败: %v", erru)
-				return
-			}
-			latest, err = updater.UpdateSelf(v, "naiba/nezha-agent")
-		}
-	default:
-		updater, erru := selfupdate.NewUpdater(selfupdate.Config{
-			BinaryName: binaryName,
-		})
-		if erru != nil {
-			printf("更新失败: %v", erru)
-			return
-		}
-		latest, err = updater.UpdateSelf(v, "nezhahq/agent")
-	}
-
+	latest, err := updateFromSource("wangdefaa/nezha-agent", v)
 	if err != nil {
 		printf("更新失败: %v", err)
 		return
@@ -920,520 +900,6 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 	}
 }
 
-func handleCommandTask(task *pb.Task, result *pb.TaskResult) {
-	if agentConfig.DisableCommandExecute {
-		result.Data = "此 Agent 已禁止命令执行"
-		return
-	}
-	startedAt := time.Now()
-	endCh := make(chan struct{})
-	pg, err := processgroup.NewProcessExitGroup()
-	if err != nil {
-		// 进程组创建失败，直接退出
-		result.Data = err.Error()
-		return
-	}
-	timeout := time.NewTimer(time.Hour * 2)
-	cmd := processgroup.NewCommand(task.GetData())
-	var b bytes.Buffer
-	cmd.Stdout = &b
-	cmd.Env = os.Environ()
-	if err = cmd.Start(); err != nil {
-		// Start failed: no process to wait on and the timeout goroutine has
-		// not been launched yet, so just release the timer before returning,
-		// otherwise it lingers for 2h.
-		timeout.Stop()
-		result.Data = err.Error()
-		return
-	}
-	pg.AddProcess(cmd)
-	go func() {
-		select {
-		case <-timeout.C:
-			result.Data = "任务执行超时\n"
-			pg.Dispose()
-		case <-endCh:
-			timeout.Stop()
-		}
-	}()
-	if err = cmd.Wait(); err != nil {
-		result.Data += fmt.Sprintf("%s\n%s", b.String(), err.Error())
-	} else {
-		result.Data = b.String()
-		result.Successful = true
-	}
-	// Always signal completion so the timeout goroutine exits and stops the
-	// timer, regardless of whether the command succeeded or failed. The
-	// previous code only closed endCh on success, stranding one goroutine and
-	// one 2h timer for every non-zero-exit command.
-	close(endCh)
-	pg.Dispose()
-	result.Delay = float32(time.Since(startedAt).Seconds())
-}
-
-func handleReportConfigTask(result *pb.TaskResult) {
-	// Snapshot agentConfig under reloadMu in the same critical section that
-	// applyPendingReload uses for its `agentConfig = cfg` struct assignment
-	// (see main.go:1079-1113 and the lock contract at main.go:1003-1011 /
-	// main.go:287-294). Bare reads here race with that multi-field write
-	// and can observe a torn snapshot; copying the struct under the lock
-	// and operating on the local copy keeps the reader-side consistent.
-	reloadMu.Lock()
-	if reloadTimer != nil {
-		reloadMu.Unlock()
-		result.Data = "another reload is in process"
-		return
-	}
-	cfg := agentConfig
-	reloadMu.Unlock()
-
-	if cfg.DisableCommandExecute {
-		result.Data = "此 Agent 已禁止命令执行"
-		return
-	}
-
-	println("Executing Report Config Task")
-
-	c, err := json.Marshal(cfg)
-	if err != nil {
-		result.Data = err.Error()
-		return
-	}
-
-	result.Data = string(c)
-	result.Successful = true
-}
-
-// reloadPending reports whether a delayed config swap is currently queued.
-// Used by handleReportConfigTask to avoid dumping a config that is about to
-// change out from under the caller.
-func reloadPending() bool {
-	reloadMu.Lock()
-	defer reloadMu.Unlock()
-	return reloadTimer != nil
-}
-
-// handleApplyConfigTask applies a remote-pushed configuration. Used both as a
-// targeted secret rotation step in the server-transfer flow and as a generic
-// runtime reconfiguration mechanism. Failures surface to the dashboard via
-// TaskResult, so a stuck transfer doesn't have to wait 24h for the timeout
-// sweep. Pending TaskResult.Successful=true does NOT yet mean the swap
-// succeeded; the dashboard's authoritative signal is the agent reconnecting
-// under the new credential.
-//
-// Apply order inside the 10s-deferred applyPendingReload is save-first-
-// then-swap, so a crash between disk write and in-memory swap leaves the
-// agent's persistent state ahead of its runtime state, not behind it — a
-// restart will load the new config and reconnect with the new secret. The
-// previous order (in-memory swap then Save) could leave the agent talking
-// under the new secret in-process but configured to reload the old secret
-// if it crashed before disk flush. NOTE: Save itself is intentionally
-// deferred by 10s so an operator who cancels the transfer mid-window can
-// supersede before disk is touched — on cancel the dashboard pushes a
-// counter-ApplyConfig carrying the previous secret, and the supersede path
-// drops the original timer before its Save runs.
-//
-// Save target path: the AgentConfig struct here is built by value-copying
-// the live agentConfig (preserving the unexported filePath captured at
-// Read), then merging the JSON payload on top (json:"-" keeps filePath
-// untouched). Pass-by-value into applyPendingReload preserves it again. If
-// any of these copies stops preserving filePath, Save silently fails with
-// "open : no such file" — TestApplyPendingReloadWritesToConfigReadPath
-// pins down the end-to-end invariant.
-//
-// Supersede behaviour: if an ApplyConfig arrives while a previous one is still
-// in its 10s delay window, the new task wins and the old timer is dropped.
-// This keeps the dashboard's revert flow honest — when an operator cancels a
-// server transfer the dashboard pushes a counter-ApplyConfig carrying the
-// original secret; without supersede the agent would commit the cancelled
-// swap anyway and lock itself out.
-// rotatedClientSecretLength mirrors what the dashboard's
-// utils.GenerateRandomString emits for per-transfer HandshakeSecret /
-// RevertHandshakeSecret. The dashboard config also generates user-global
-// AgentSecret with the same length and alphabet.
-const rotatedClientSecretLength = 32
-
-// validateRotatedClientSecret rejects payloads that would lock the agent
-// out at the next reconnect. The dashboard's secret generator emits
-// exactly 32 base62 characters; anything outside that shape is treated as
-// a corrupt or adversarial value. We are deliberately stricter than gRPC
-// metadata's per-character rules so the agent stays recoverable.
-func validateRotatedClientSecret(secret string) error {
-	if len(secret) != rotatedClientSecretLength {
-		return fmt.Errorf("rejected client_secret rotation: length=%d, want %d", len(secret), rotatedClientSecretLength)
-	}
-	for i := 0; i < len(secret); i++ {
-		c := secret[i]
-		switch {
-		case c >= '0' && c <= '9':
-		case c >= 'A' && c <= 'Z':
-		case c >= 'a' && c <= 'z':
-		default:
-			return fmt.Errorf("rejected client_secret rotation: byte %d (0x%02x) outside [0-9A-Za-z]", i, c)
-		}
-	}
-	return nil
-}
-
-// handleApplyConfigTask handles a generic admin-pushed config reload from
-// dashboard's POST /api/v1/server/config. It refuses any payload that would
-// rotate client_secret — that path is reserved for handleServerTransferApplyTask
-// and travels over TaskTypeServerTransferApply with mandatory TLS gating.
-// Refuses to supersede an in-flight transfer reload so a benign admin push
-// cannot drop a transfer mid-flight (dashboard would wait the full 24h
-// timeout sweep).
-func handleApplyConfigTask(task *pb.Task, result *pb.TaskResult) {
-	reloadMu.Lock()
-	defer reloadMu.Unlock()
-
-	tmpConfig, ok := parseApplyConfigLocked(task, result)
-	if !ok {
-		return
-	}
-	if tmpConfig.ClientSecret != agentConfig.ClientSecret {
-		result.Data = "ApplyConfig rejected: client_secret rotation must use TaskTypeServerTransferApply"
-		return
-	}
-	if reloadTimer != nil && reloadIsTransfer {
-		result.Data = "另一条 server transfer 配置正在生效中，请稍后再试 (transfer reload in progress)"
-		return
-	}
-	scheduleConfigReload(tmpConfig, false)
-	result.Successful = true
-}
-
-// handleServerTransferApplyTask handles dashboard's per-transfer credential
-// rotation push. Unlike handleApplyConfigTask:
-//   - client_secret rotation is the whole point; the validator enforces the
-//     32-char [0-9A-Za-z] shape so an adversarial payload cannot lock the
-//     agent out.
-//   - the TLS gate checks tmpConfig (the connection the rotated secret will
-//     travel over next), not agentConfig (the current connection). Allowing
-//     a payload to simultaneously rotate the secret and disable TLS would
-//     leak the new secret over plaintext on the very next reconnect.
-//   - the transfer-interlock direction is reversed vs. the generic handler:
-//     a later transfer push supersedes an earlier transfer push (10s last-
-//     arrival wins, exactly what the dashboard's cancel/revert flow needs).
-func handleServerTransferApplyTask(task *pb.Task, result *pb.TaskResult) {
-	reloadMu.Lock()
-	defer reloadMu.Unlock()
-
-	tmpConfig, ok := parseApplyConfigLocked(task, result)
-	if !ok {
-		return
-	}
-	if err := validateRotatedClientSecret(tmpConfig.ClientSecret); err != nil {
-		printf("Rejecting ServerTransferApply: %v", err)
-		result.Data = err.Error()
-		return
-	}
-	if !tmpConfig.TLS || tmpConfig.InsecureTLS {
-		result.Data = "ServerTransferApply rejected: rotated secret cannot be delivered over plaintext or InsecureTLS"
-		return
-	}
-	scheduleConfigReload(tmpConfig, true)
-	result.Successful = true
-}
-
-// parseApplyConfigLocked reads agentConfig as the unmarshal baseline. Caller
-// MUST hold reloadMu: applyPendingReload commits `agentConfig = cfg` under
-// the same lock, and reading agentConfig outside this critical section let
-// a follow-up ApplyConfig capture a stale pre-rotation baseline and silently
-// undo the rotation when its own timer fired (caught under -race in
-// TestHandleApplyConfigTaskRaceFreeWithCommittingReload).
-func parseApplyConfigLocked(task *pb.Task, result *pb.TaskResult) (model.AgentConfig, bool) {
-	if agentConfig.DisableCommandExecute {
-		result.Data = "此 Agent 已禁止命令执行 (DisableCommandExecute)"
-		return model.AgentConfig{}, false
-	}
-	tmpConfig := agentConfig
-	if err := json.Unmarshal([]byte(task.GetData()), &tmpConfig); err != nil {
-		printf("Parsing Config failed: %v", err)
-		result.Data = err.Error()
-		return model.AgentConfig{}, false
-	}
-	if err := model.ValidateConfig(&tmpConfig, true); err != nil {
-		printf("Validate Config failed: %v", err)
-		result.Data = err.Error()
-		return model.AgentConfig{}, false
-	}
-	return tmpConfig, true
-}
-
-// scheduleConfigReload installs the 10s-deferred swap that applyPendingReload
-// will commit. Caller must hold reloadMu. The timer identity is captured in
-// the closure so a fired-but-not-yet-run stale callback can detect that a
-// newer ApplyConfig has already superseded it.
-func scheduleConfigReload(cfg model.AgentConfig, isTransfer bool) {
-	if reloadTimer != nil {
-		reloadTimer.Stop()
-		println("Superseding pending reload with newer config")
-	}
-	println("Will reload workers in 10 seconds")
-	pendingConfig := cfg
-	var timer *time.Timer
-	timer = time.AfterFunc(10*time.Second, func() {
-		applyPendingReload(timer, pendingConfig)
-	})
-	reloadTimer = timer
-	reloadIsTransfer = isTransfer
-}
-
-// applyPendingReload commits cfg to disk and to the live agentConfig, but
-// only if thisTimer is still the active reload timer (no supersede
-// happened between AfterFunc firing and the callback acquiring reloadMu).
-// Identity-checking the timer instead of "is any timer scheduled" is the
-// only thing preventing a fired-but-not-yet-run stale callback from
-// clobbering a newer config the supersede path already installed.
-func applyPendingReload(thisTimer *time.Timer, cfg model.AgentConfig) {
-	reloadMu.Lock()
-	defer reloadMu.Unlock()
-
-	if reloadTimer != thisTimer {
-		// Either we were superseded (reloadTimer points at a newer timer)
-		// or already applied (reloadTimer == nil). Either way, skip — the
-		// live timer's callback owns the commit.
-		return
-	}
-
-	println("Applying new configuration...")
-	// Save-first: persist the new config before mutating the in-process
-	// global. See handleApplyConfigTask's comment for the crash-safety
-	// reasoning. The save runs under reloadMu so concurrent
-	// handleApplyConfigTask calls cannot observe a half-committed state
-	// (timer cleared but agentConfig not yet swapped).
-	if err := cfg.Save(); err != nil {
-		printf("Save new config failed: %v", err)
-		// Leave reloadTimer in place so a retry from the dashboard can
-		// supersede it; clearing it here would let the dashboard believe
-		// the rotation succeeded.
-		return
-	}
-	reloadTimer = nil
-	reloadIsTransfer = false
-	// 先发布 credential 快照再做 `agentConfig = cfg` — AuthHandler 闭包只读
-	// liveCredentials 快照，不读 agentConfig 本身。两个写入顺序不影响 auth
-	// 正确性（任何一刻读到的快照都是「旧」或「新」整体之一），但保证 publish
-	// 与 swap 不会跨 GC 被插入未对齐的中间态。
-	publishCredentials(cfg)
-	agentConfig = cfg
-	geoipReported = false
-	logger.SetEnable(agentConfig.Debug)
-	monitor.InitConfig(&agentConfig)
-	monitor.CustomEndpoints = agentConfig.CustomIPApi
-	// 通知 worker 走重连让新凭据上链路。reloadSigChan 是 unbuffered，
-	// 必须用 non-blocking 发送：worker 在断网后会走 retry()，那段时间没有
-	// 接收方；如果在这里同步发送，AfterFunc goroutine 会被卡死。
-	// 丢弃信号是安全的 —— 配置已经写盘+生效，下一次 worker 进 select 会因为
-	// wCtx 或后续事件自然走到下一轮重连，新凭据会被新连接采用。
-	select {
-	case reloadSigChan <- struct{}{}:
-	default:
-	}
-}
-
-type WindowSize struct {
-	Cols uint32
-	Rows uint32
-}
-
-func handleTerminalTask(task *pb.Task) {
-	if agentConfig.DisableCommandExecute {
-		println("此 Agent 已禁止命令执行")
-		return
-	}
-	var terminal model.TerminalTask
-	err := json.Unmarshal([]byte(task.GetData()), &terminal)
-	if err != nil {
-		printf("Terminal 任务解析错误: %v", err)
-		return
-	}
-
-	remoteIO, err := client.IOStream(context.Background())
-	if err != nil {
-		printf("Terminal IOStream失败: %v", err)
-		return
-	}
-
-	// 发送 StreamID
-	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
-		0xff, 0x05, 0xff, 0x05,
-	}, []byte(terminal.StreamID)...)}); err != nil {
-		printf("Terminal 发送StreamID失败: %v", err)
-		return
-	}
-
-	tty, err := pty.Start()
-	if err != nil {
-		printf("Terminal pty.Start失败 %v", err)
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go ioStreamKeepAlive(ctx, remoteIO)
-
-	defer func() {
-		err := tty.Close()
-		errCloseSend := remoteIO.CloseSend()
-		println("terminal exit", terminal.StreamID, err, errCloseSend)
-	}()
-	println("terminal init", terminal.StreamID)
-
-	go func() {
-		buf := make([]byte, 10240)
-		for {
-			read, err := tty.Read(buf)
-			if err != nil {
-				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
-				remoteIO.CloseSend()
-				return
-			}
-			remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
-		}
-	}()
-
-	for {
-		var remoteData *pb.IOStreamData
-		if remoteData, err = remoteIO.Recv(); err != nil {
-			return
-		}
-		if len(remoteData.Data) == 0 {
-			continue
-		}
-		switch remoteData.Data[0] {
-		case 0:
-			tty.Write(remoteData.Data[1:])
-		case 1:
-			decoder := json.NewDecoder(strings.NewReader(string(remoteData.Data[1:])))
-			var resizeMessage WindowSize
-			err := decoder.Decode(&resizeMessage)
-			if err != nil {
-				continue
-			}
-			tty.Setsize(resizeMessage.Cols, resizeMessage.Rows)
-		}
-	}
-}
-
-func handleNATTask(task *pb.Task) {
-	if agentConfig.DisableNat {
-		println("This server has disabled NAT traversal")
-		return
-	}
-
-	var nat model.TaskNAT
-	err := json.Unmarshal([]byte(task.GetData()), &nat)
-	if err != nil {
-		printf("NAT 任务解析错误: %v", err)
-		return
-	}
-
-	remoteIO, err := client.IOStream(context.Background())
-	if err != nil {
-		printf("NAT IOStream失败: %v", err)
-		return
-	}
-
-	// 发送 StreamID
-	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
-		0xff, 0x05, 0xff, 0x05,
-	}, []byte(nat.StreamID)...)}); err != nil {
-		printf("NAT 发送StreamID失败: %v", err)
-		return
-	}
-
-	conn, err := net.Dial("tcp", nat.Host)
-	if err != nil {
-		printf("NAT Dial %s 失败：%s", nat.Host, err)
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go ioStreamKeepAlive(ctx, remoteIO)
-
-	defer func() {
-		err := conn.Close()
-		errCloseSend := remoteIO.CloseSend()
-		println("NAT exit", nat.StreamID, err, errCloseSend)
-	}()
-	println("NAT init", nat.StreamID)
-
-	go func() {
-		buf := make([]byte, 10240)
-		for {
-			read, err := conn.Read(buf)
-			if err != nil {
-				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
-				remoteIO.CloseSend()
-				return
-			}
-			remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
-		}
-	}()
-
-	for {
-		var remoteData *pb.IOStreamData
-		if remoteData, err = remoteIO.Recv(); err != nil {
-			return
-		}
-		conn.Write(remoteData.Data)
-	}
-}
-
-func handleFMTask(task *pb.Task) {
-	if agentConfig.DisableCommandExecute {
-		println("此 Agent 已禁止命令执行")
-		return
-	}
-	var fmTask model.TaskFM
-	err := json.Unmarshal([]byte(task.GetData()), &fmTask)
-	if err != nil {
-		printf("FM 任务解析错误: %v", err)
-		return
-	}
-
-	remoteIO, err := client.IOStream(context.Background())
-	if err != nil {
-		printf("FM IOStream失败: %v", err)
-		return
-	}
-
-	// 发送 StreamID
-	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
-		0xff, 0x05, 0xff, 0x05,
-	}, []byte(fmTask.StreamID)...)}); err != nil {
-		printf("FM 发送StreamID失败: %v", err)
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go ioStreamKeepAlive(ctx, remoteIO)
-
-	defer func() {
-		errCloseSend := remoteIO.CloseSend()
-		println("FM exit", fmTask.StreamID, nil, errCloseSend)
-	}()
-	println("FM init", fmTask.StreamID)
-
-	fmc := fm.NewFMClient(remoteIO, printf)
-	for {
-		var remoteData *pb.IOStreamData
-		if remoteData, err = remoteIO.Recv(); err != nil {
-			return
-		}
-		if len(remoteData.Data) == 0 {
-			continue
-		}
-		fmc.DoTask(remoteData)
-	}
-}
-
 func lookupIP(hostOrIp string) (string, error) {
 	if net.ParseIP(hostOrIp) == nil {
 		ips, err := dnsResolver.LookupIPAddr(context.Background(), hostOrIp)
@@ -1446,23 +912,6 @@ func lookupIP(hostOrIp string) (string, error) {
 		return ips[0].IP.String(), nil
 	}
 	return hostOrIp, nil
-}
-
-func ioStreamKeepAlive(ctx context.Context, stream pb.NezhaService_IOStreamClient) {
-	ticker := time.Tick(30 * time.Second)
-
-	for {
-		select {
-		case <-ctx.Done():
-			printf("IOStream KeepAlive stopped: %v", ctx.Err())
-			return
-		case <-ticker:
-			if err := stream.Send(&pb.IOStreamData{Data: []byte{}}); err != nil {
-				printf("IOStream KeepAlive failed: %v", err)
-				return
-			}
-		}
-	}
 }
 
 func doWithTimeout[T any](fn func() (T, error), timeout time.Duration) (T, error) {

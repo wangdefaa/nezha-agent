@@ -1,0 +1,25 @@
+# 哪吒监控 Agent —— Docker Compose 部署
+#
+# Agent 采集宿主机指标(CPU/内存/磁盘/网络/进程)。容器化时:
+#   - network_mode: host  采集真实网络与连接数,并直连面板
+#   - pid: host           采集宿主进程数
+# 受容器隔离限制,磁盘等部分指标仍只反映容器视图;若需完整宿主监控,
+# 更推荐用 install.sh 以 systemd 服务直接部署在宿主机上。
+#
+# 使用:
+#   1. cp config.yaml.example config.yml   # 填写 server / client_secret
+#   2. config.yml 中建议设 disable_auto_update: true(镜像内自更新无意义)
+#   3. docker compose up -d --build
+services:
+  agent:
+    build: .
+    image: nezha-agent:local
+    container_name: nezha-agent
+    restart: always
+    network_mode: host          # 采集真实网络/连接数,并直连面板
+    pid: host                   # 采集宿主进程数
+    volumes:
+      - ./config.yml:/etc/nezha/config.yml:ro
+    command: ["-c", "/etc/nezha/config.yml"]
+    environment:
+      TZ: Asia/Shanghai

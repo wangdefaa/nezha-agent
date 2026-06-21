@@ -29,8 +29,7 @@ func TestAuthHandlerReadsCredentialsPerCall(t *testing.T) {
 		t.Fatalf("expected old-secret in hyphenated metadata, got %q", md["client-secret"])
 	}
 
-	// Rotate the credential the way handleApplyConfigTask's reload would after
-	// the save-then-swap completes.
+	// 闭包按调用读取：即使底层值变化，下一次调用也应读到新值。
 	secret = "new-secret"
 
 	md, err = a.GetRequestMetadata(context.Background())
