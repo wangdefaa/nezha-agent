@@ -1,132 +1,136 @@
+# Agent 发版：推 v* tag → 先跑 test.yml → 单 job 交叉编译全部目标 → 独立 job 签名并发布。
+# 手动触发（workflow_dispatch）只构建并上传 artifact，不签名、不发版。
+#
+# 资产契约（改名 = 旧 agent 无法自更新、安装脚本 404）：
+#   nezha-agent_{os}_{arch}.zip   zip 内只有一个文件 nezha-agent（windows 为 nezha-agent.exe）
+#   nezha-agent_{os}_{arch}.zip.sig   对 zip 的 ECDSA P-256 / SHA-256 签名（ASN.1 DER）
+#   checksums.txt
+# 依据：cmd/agent/updater.go（DetectLatest + 下载 <asset>.sig 验签）、
+#       go-github-selfupdate 按 *{GOOS}_{GOARCH}.zip 后缀匹配且忽略 draft/prerelease、
+#       script/install.sh 与 script/install.ps1 走 releases/latest/download/nezha-agent_{os}_{arch}.zip。
 name: Release
 
 on:
   push:
     tags:
       - "v*"
-    branches:
-      - main
-    paths-ignore:
-      - ".github/workflows/agent.yml"
-      - ".github/workflows/codeql-analysis.yml"
-      - ".github/workflows/test.yml"
-      - "README.md"
-      - ".goreleaser.yml"
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    strategy:
-      fail-fast: true
-      matrix:
-        goos: [linux, windows, darwin, freebsd]
-        goarch: [amd64, arm64, 386]
-        include:
-          - goos: linux
-            goarch: 386
-          - goos: linux
-            goarch: s390x
-          - goos: linux
-            goarch: riscv64
-          - goos: linux
-            goarch: arm
-          - goos: linux
-            goarch: mips
-            gomips: softfloat
-          - goos: linux
-            goarch: mipsle
-            gomips: softfloat
-          - goos: linux
-            goarch: loong64
-          - goos: freebsd
-            goarch: arm
-        exclude:
-          - goos: darwin
-            goarch: 386
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
 
-    name: Build artifacts
+  build:
+    name: Build & package
+    needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
-          go-version: ^1.26.1
+          go-version-file: go.mod
+          cache: false # 发版不复用 Go 缓存，避免缓存投毒进入签名产物
 
-      - name: Build Test
-        if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
-        uses: goreleaser/goreleaser-action@v7
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOMIPS: ${{ matrix.gomips }}
+      - name: Build all targets
+        uses: goreleaser/goreleaser-action@v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: build --single-target --clean --skip=validate --snapshot
+          args: build --clean --skip=validate ${{ github.ref_type != 'tag' && '--snapshot' || '' }}
 
-      - name: Build
-        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-        uses: goreleaser/goreleaser-action@v7
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOMIPS: ${{ matrix.gomips }}
+      - name: Package zips
+        run: |
+          mkdir -p out
+          jq -r '.[] | select(.type == "Binary") | [.goos, .goarch, .path] | @tsv' dist/artifacts.json > targets.tsv
+          test -s targets.tsv
+          while IFS=$'\t' read -r goos goarch path; do
+            zipfile="out/nezha-agent_${goos}_${goarch}.zip"
+            if [ -e "$zipfile" ]; then
+              echo "::error::重复目标 ${goos}_${goarch}（例如同时配置了多个 goarm），资产名会冲突"
+              exit 1
+            fi
+            zip -9 -j -q "$zipfile" "$path"
+            want=nezha-agent
+            if [ "$goos" = windows ]; then want=nezha-agent.exe; fi
+            test "$(unzip -Z1 "$zipfile")" = "$want"
+          done < targets.tsv
+          ls -l out
+
+      - uses: actions/upload-artifact@v7.0.1
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: build --single-target --clean --skip=validate
+          name: agent-zips
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Archive
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: zip -jr dist/nezha-agent_${GOOS}_${GOARCH}.zip dist/*/*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}
-          path: |
-            ./dist/nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
-
-  release:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+  publish:
+    name: Sign & publish
+    if: github.ref_type == 'tag'
     needs: build
-    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # 本 job 接触签名私钥：只用 GitHub 官方 action + 预装的 openssl/gh，不引入第三方 action
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7.0.1
         with:
-          path: ./assets
+          persist-credentials: false
+          sparse-checkout: cmd/agent/updater.go
+          sparse-checkout-cone-mode: false
 
-      - name: Checksum
-        run: sha256sum ./assets/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: agent-zips
+          path: out
 
-      - name: Sign release assets
+      - name: Sign and verify against the embedded public key
         env:
           AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
         run: |
-          printf '%s' "$AGENT_SIGNING_KEY" > /tmp/agent-signing.key
-          for f in ./assets/*/*.zip; do
-            openssl dgst -sha256 -sign /tmp/agent-signing.key -out "$f.sig" "$f"
+          if [ -z "$AGENT_SIGNING_KEY" ]; then
+            echo "::error::未配置 secret AGENT_SIGNING_KEY"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/agent-signing.key"
+          pub="$RUNNER_TEMP/agent-signing.pub"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$AGENT_SIGNING_KEY" > "$key"
+          # 用 updater.go 里内置的公钥验签：不通过说明 secret 与内置公钥不配对，发出去所有 agent 都会拒绝更新
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' cmd/agent/updater.go \
+            | sed -e 's/`$//' -e 's/^.*`//' > "$pub"
+          for f in out/*.zip; do
+            openssl dgst -sha256 -sign "$key" -out "$f.sig" "$f"
+            openssl dgst -sha256 -verify "$pub" -signature "$f.sig" "$f" > /dev/null
           done
-          rm -f /tmp/agent-signing.key
+          (cd out && sha256sum -- *.zip > checksums.txt)
+          ls -l out
 
-      - name: Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            checksums.txt
-            assets/*/*.zip
-            assets/*/*.sig
-          generate_release_notes: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          # 带 - 的 tag（如 v2.3.0-rc1）标为 prerelease：自更新与 releases/latest 都会跳过它
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          # gh 先建 draft、传完资产再发布（失败自动删 draft），agent 不会看到半成品 release；
+          # 同名 release 已存在时会失败——有意为之：不要覆盖已发布版本的资产，请发新版本号。
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes "${flags[@]}" \
+            out/*.zip out/*.zip.sig out/checksums.txt

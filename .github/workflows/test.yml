@@ -1,36 +1,92 @@
-name: Run Tests
+# Agent 质量门禁：tidy / gofmt / vet（含 windows、darwin 交叉 vet）/ 单测（race + shuffle）
+# / 全部发版目标交叉编译（替代原 release.yml 在 main 与 PR 上跑的 18 个 job 快照构建）+ govulncheck。
+# 同时以 workflow_call 被 release.yml 复用：打 tag 时必须先过这里才会发版。
+# 不加 schedule：公开仓库 60 天无活动会把带 schedule 的 workflow 整个自动停用（CodeQL 已因此停用）。
+name: Test
 
 on:
   push:
+    branches:
+      - main
     paths-ignore:
-      - ".github/workflows/agent.yml"
-      - ".github/workflows/codeql-analysis.yml"
-      - "README.md"
-      - ".goreleaser.yml"
+      - "**.md"
+      - "LICENSE"
+      - "script/**"
+      - "Dockerfile"
+      - "docker-compose.yaml"
+      - "config.yaml.example"
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  tests:
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu, windows, macos]
-
-    runs-on: ${{ matrix.os }}-latest
+  test:
+    name: Test & lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7.0.1
         with:
-          go-version: ^1.26.1
+          persist-credentials: false
 
-      - name: Unit test
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: go.mod / go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: gofmt
         run: |
-          go test -v ./...
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未 gofmt，请运行 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
 
-      #- name: Run Gosec Security Scanner
-      #  if: runner.os == 'Linux'
-      #  run: |
-      #    go install github.com/securego/gosec/v2/cmd/gosec@v2.19.0
-      #    gosec -exclude=G104 ./...
+      - name: go vet (linux / windows / darwin)
+        # 单测没有平台相关用例，用交叉 vet 覆盖 windows/darwin 的平台文件，替代原来的三平台 runner
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
+
+      - name: Unit test (race + shuffle)
+        run: go test -race -shuffle=on -count=1 ./...
+
+      - name: Cross-build all release targets
+        # 与发版共用 .goreleaser.yml；打 tag 时 release.yml 会正式构建一次，这里跳过避免重复
+        if: github.ref_type != 'tag'
+        uses: goreleaser/goreleaser-action@v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --snapshot --clean --skip=validate
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...

@@ -52,7 +52,14 @@ var statDataFetchAttempts = map[uint8]uint8{
 	Load: 0,
 }
 
-var stateLock sync.Mutex
+// GetHost 可能被重连中的 run() 与上一代上报协程同时调用，采集状态统一加锁：
+// hostLock 保护 hostDataFetchAttempts（map 并发写会直接 fatal，recover 兜不住），
+// stateLock 保护 statDataFetchAttempts，metricLock 保护网速计数与开机时间。
+var (
+	hostLock   sync.Mutex
+	stateLock  sync.Mutex
+	metricLock sync.RWMutex
+)
 
 func InitConfig(cfg *model.AgentConfig) {
 	agentConfig = cfg
@@ -61,136 +68,147 @@ func InitConfig(cfg *model.AgentConfig) {
 // GetHost 获取主机硬件信息
 func GetHost() *model.Host {
 	var ret model.Host
+	cpuType := fillHostInfo(&ret)
+	ctxCpu := context.WithValue(context.Background(), cpu.CPUHostKey, cpuType)
+	ret.CPU = tryHost(ctxCpu, CPU, cpu.GetHost)
+	ret.DiskTotal = getDiskTotal()
+	ret.MemTotal, ret.SwapTotal = getMemTotal()
+	ret.Version = Version
+	return &ret
+}
 
-	var cpuType string
+// fillHostInfo 填充平台、架构、虚拟化与开机时间，返回 CPU 类型（Virtual/Physical）。
+func fillHostInfo(ret *model.Host) string {
 	hi, err := host.Info()
 	if err != nil {
 		printf("host.Info error: %v", err)
-	} else {
-		if hi.VirtualizationRole == "guest" {
-			cpuType = "Virtual"
-			ret.Virtualization = hi.VirtualizationSystem
-		} else {
-			cpuType = "Physical"
-			ret.Virtualization = ""
-		}
-		ret.Platform = hi.Platform
-		ret.PlatformVersion = hi.PlatformVersion
-		ret.Arch = hi.KernelArch
-		ret.BootTime = hi.BootTime
-		cachedBootTime = time.Unix(int64(hi.BootTime), 0)
+		return ""
 	}
+	cpuType := "Physical"
+	if hi.VirtualizationRole == "guest" {
+		cpuType = "Virtual"
+		ret.Virtualization = hi.VirtualizationSystem
+	}
+	ret.Platform = hi.Platform
+	ret.PlatformVersion = hi.PlatformVersion
+	ret.Arch = hi.KernelArch
+	ret.BootTime = hi.BootTime
+	metricLock.Lock()
+	cachedBootTime = time.Unix(int64(hi.BootTime), 0)
+	metricLock.Unlock()
+	return cpuType
+}
 
-	ctxCpu := context.WithValue(context.Background(), cpu.CPUHostKey, cpuType)
-	ret.CPU = tryHost(ctxCpu, CPU, cpu.GetHost)
-
-	ret.DiskTotal = getDiskTotal()
-
+// getMemTotal 返回内存与 swap 总量。
+func getMemTotal() (memTotal, swapTotal uint64) {
 	mv, err := mem.VirtualMemory()
 	if err != nil {
 		printf("mem.VirtualMemory error: %v", err)
 	} else {
-		ret.MemTotal = mv.Total
-		if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-			ret.SwapTotal = mv.SwapTotal
+		memTotal = mv.Total
+		if !swapFromSwapMemory() {
+			swapTotal = mv.SwapTotal
 		}
 	}
-
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+	if swapFromSwapMemory() {
 		ms, err := mem.SwapMemory()
 		if err != nil {
 			printf("mem.SwapMemory error: %v", err)
 		} else {
-			ret.SwapTotal = ms.Total
+			swapTotal = ms.Total
 		}
 	}
-
-	ret.Version = Version
-
-	return &ret
+	return memTotal, swapTotal
 }
 
 func GetState(skipConnectionCount bool, skipProcsCount bool) *model.HostState {
 	var ret model.HostState
-
-	cp := tryStat(context.Background(), CPU, cpu.GetState)
-	if len(cp) > 0 {
+	if cp := tryStat(context.Background(), CPU, cpu.GetState); len(cp) > 0 {
 		ret.CPU = cp[0]
 	}
+	ret.MemUsed, ret.SwapUsed = getMemUsed()
+	ret.DiskUsed = getDiskUsed()
+	// tryStat 失败或已达重试上限时返回零值（nil 指针），必须判空再解引用
+	if loadStat := tryStat(context.Background(), Load, load.GetState); loadStat != nil {
+		ret.Load1, ret.Load5, ret.Load15 = loadStat.Load1, loadStat.Load5, loadStat.Load15
+	}
+	if !skipProcsCount {
+		ret.ProcessCount = getProcessCount()
+	}
+	fillNetState(&ret)
+	if !skipConnectionCount {
+		ret.TcpConnCount, ret.UdpConnCount = getConns()
+	}
+	return &ret
+}
 
+// getMemUsed 返回已用内存与 swap。
+func getMemUsed() (memUsed, swapUsed uint64) {
 	vm, err := mem.VirtualMemory()
 	if err != nil {
 		printf("mem.VirtualMemory error: %v", err)
 	} else {
 		if vm.Used > math.MaxInt64 && runtime.GOOS == "linux" {
 			// alternative calculation method for lxc containers where `MemAvailable` can be larger than `MemTotal`
-			ret.MemUsed = vm.Total - vm.Free
+			memUsed = vm.Total - vm.Free
 		} else {
-			ret.MemUsed = vm.Used
+			memUsed = vm.Used
 		}
-		if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-			ret.SwapUsed = vm.SwapTotal - vm.SwapFree
+		if !swapFromSwapMemory() {
+			swapUsed = vm.SwapTotal - vm.SwapFree
 		}
 	}
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
-		// gopsutil 在 Windows/Darwin 下通过 SwapMemory 获取 swap
+	if swapFromSwapMemory() {
 		ms, err := mem.SwapMemory()
 		if err != nil {
 			printf("mem.SwapMemory error: %v", err)
 		} else {
-			ret.SwapUsed = ms.Used
+			swapUsed = ms.Used
 		}
 	}
+	return memUsed, swapUsed
+}
 
-	ret.DiskUsed = getDiskUsed()
+// swapFromSwapMemory 报告 swap 是否需经 SwapMemory 获取（gopsutil 在 Windows/Darwin 下如此）。
+func swapFromSwapMemory() bool {
+	return runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+}
 
-	loadStat := tryStat(context.Background(), Load, load.GetState)
-	ret.Load1 = loadStat.Load1
-	ret.Load5 = loadStat.Load5
-	ret.Load15 = loadStat.Load15
-
-	var procs []int32
-	if !skipProcsCount {
-		procs, err = process.Pids()
-		if err != nil {
-			printf("process.Pids error: %v", err)
-		} else {
-			ret.ProcessCount = uint64(len(procs))
-		}
+func getProcessCount() uint64 {
+	procs, err := process.Pids()
+	if err != nil {
+		printf("process.Pids error: %v", err)
+		return 0
 	}
+	return uint64(len(procs))
+}
 
+// fillNetState 在 metricLock 下读取流量、网速与开机时长，避免与 TrackNetworkSpeed 并发读写。
+func fillNetState(ret *model.HostState) {
+	metricLock.RLock()
+	defer metricLock.RUnlock()
 	ret.NetInTransfer, ret.NetOutTransfer = netInTransfer, netOutTransfer
 	ret.NetInSpeed, ret.NetOutSpeed = netInSpeed, netOutSpeed
 	ret.Uptime = uint64(time.Since(cachedBootTime).Seconds())
-
-	if !skipConnectionCount {
-		ret.TcpConnCount, ret.UdpConnCount = getConns()
-	}
-
-	return &ret
 }
 
 // TrackNetworkSpeed NIC监控，统计流量与速度
 func TrackNetworkSpeed() {
-	var innerNetInTransfer, innerNetOutTransfer uint64
-
 	ctx := context.WithValue(context.Background(), nic.NICKey, agentConfig.NICAllowlist)
 	nc, err := nic.GetState(ctx)
 	if err != nil {
 		return
 	}
 
-	innerNetInTransfer = nc[0]
-	innerNetOutTransfer = nc[1]
-
 	now := uint64(time.Now().Unix())
+	metricLock.Lock()
+	defer metricLock.Unlock()
 	diff := util.SubUintChecked(now, lastUpdateNetStats)
 	if diff > 0 {
-		netInSpeed = util.SubUintChecked(innerNetInTransfer, netInTransfer) / diff
-		netOutSpeed = util.SubUintChecked(innerNetOutTransfer, netOutTransfer) / diff
+		netInSpeed = util.SubUintChecked(nc[0], netInTransfer) / diff
+		netOutSpeed = util.SubUintChecked(nc[1], netOutTransfer) / diff
 	}
-	netInTransfer = innerNetInTransfer
-	netOutTransfer = innerNetOutTransfer
+	netInTransfer, netOutTransfer = nc[0], nc[1]
 	lastUpdateNetStats = now
 }
 
@@ -225,6 +243,9 @@ type hostStateFunc[T any] func(context.Context) (T, error)
 
 func tryHost[T any](ctx context.Context, typ uint8, f hostStateFunc[T]) T {
 	var val T
+
+	hostLock.Lock()
+	defer hostLock.Unlock()
 
 	if hostDataFetchAttempts[typ] < maxDeviceDataFetchAttempts {
 		v, err := f(ctx)

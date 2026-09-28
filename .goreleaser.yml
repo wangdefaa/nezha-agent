@@ -1,34 +1,47 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# 只用 goreleaser 的 build（多目标并行交叉编译）；打包 / 签名 / 发版在 .github/workflows/release.yml 里做。
+# 注意：release 资产名 nezha-agent_{os}_{arch}.zip 是契约（自更新 + install.sh/ps1 都靠它），
+#       由 release.yml 按 dist/artifacts.json 的 goos/goarch 生成，与这里的 build id / 目录名无关。
 version: 2
-before:
-  hooks:
-    - go mod tidy -v
+
+# 不在构建时 go mod tidy：go.mod/go.sum 以仓库为准，是否 tidy 由 test.yml 的 `go mod tidy -diff` 把关。
+
 builds:
   - id: universal
+    main: ./cmd/agent
+    binary: nezha-agent
     env:
       - CGO_ENABLED=0
     ldflags:
+      # Version 必须是不带 v 的 semver（自更新用 semver.Parse 比较）；main.arch 供 Windows 架构自检
       - -s -w -X github.com/nezhahq/agent/pkg/monitor.Version={{.Version}} -X main.arch={{.Arch}}
     goos:
       - linux
-      - windows
-      - freebsd
       - darwin
+      - windows
+      # - freebsd   # 可选：install.sh 不支持 freebsd，只能手动装；需要时取消注释
     goarch:
-      - arm
-      - arm64
-      - 386
       - amd64
-      - mips
-      - mipsle
-      - s390x
-      - riscv64
-      - loong64
-    gomips:
-      - softfloat
+      - arm64
+      - arm
+      # 可选冷门架构（v2.2.3 下载量均为 0；需要时取消注释即可，单 job 构建几乎不增加耗时）：
+      # - 386
+      # - riscv64
+      # - mipsle
+      # - mips
+      # - s390x
+      # - loong64
+    goarm:
+      - "6" # 显式写出 goreleaser 默认值：armv6l / armv7l 都能跑（install.sh 把二者都映射到 arm）
+    # gomips:
+    #   - softfloat # 恢复 mips/mipsle 时一并取消注释，保持与历史产物一致
     ignore:
+      - goos: darwin
+        goarch: arm
       - goos: windows
         goarch: arm
-    main: ./cmd/agent
-    binary: nezha-agent
+
 snapshot:
-  version_template: "nezha-agent"
+  # 非 tag 构建（workflow_dispatch / test.yml 的交叉编译检查）用合法 semver 预发布号，
+  # 这样误装的测试包仍能被自更新到正式版（旧模板 "nezha-agent" 不是 semver，会卡住）。
+  version_template: "0.0.0-snapshot-{{ .ShortCommit }}"

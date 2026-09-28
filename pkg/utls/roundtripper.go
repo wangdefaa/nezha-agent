@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
@@ -74,12 +75,52 @@ var (
 	errExpired       = errors.New("connection have expired")
 )
 
+// 拨号与 TLS 握手的上限。原实现无超时且在全局锁内握手：一个只接受 TCP、不回
+// ServerHello 的目标即可永久占住锁，拖死此后所有 HTTPS 拨测并逐次泄漏 goroutine。
+const (
+	dialTimeout      = 10 * time.Second
+	handshakeTimeout = 10 * time.Second
+	idleConnTimeout  = 90 * time.Second
+)
+
 func (r *uTLSHTTPRoundTripperImpl) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header = r.headers
+	// RoundTripper 不应修改调用方的请求；共享 header map 也不能直接挂到并发请求上
+	req = req.Clone(req.Context())
+	req.Header = r.headers.Clone()
 
 	if req.URL.Scheme != "https" {
 		return r.backdropTransport.RoundTrip(req)
 	}
+	var conn net.Conn
+	trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) { conn = i.Conn }}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	resp, err := r.roundTripHTTPS(req)
+	if err == nil && resp.TLS == nil {
+		resp.TLS = tlsStateOf(conn)
+	}
+	return resp, err
+}
+
+// tlsStateOf 把 uTLS 连接状态转成 crypto/tls 结构。net/http 与 http2 只识别 *tls.Conn，
+// 经 uTLS 拨号时 resp.TLS 恒为 nil，拨测因此一直拿不到证书签发者与到期时间。
+func tlsStateOf(c net.Conn) *tls.ConnectionState {
+	uc, ok := c.(*utls.UConn)
+	if !ok {
+		return nil
+	}
+	s := uc.ConnectionState()
+	return &tls.ConnectionState{
+		Version:            s.Version,
+		HandshakeComplete:  s.HandshakeComplete,
+		CipherSuite:        s.CipherSuite,
+		NegotiatedProtocol: s.NegotiatedProtocol,
+		ServerName:         s.ServerName,
+		PeerCertificates:   s.PeerCertificates,
+		VerifiedChains:     s.VerifiedChains,
+	}
+}
+
+func (r *uTLSHTTPRoundTripperImpl) roundTripHTTPS(req *http.Request) (*http.Response, error) {
 	for retryCount := 0; retryCount < 5; retryCount++ {
 		effectivePort := req.URL.Port()
 		if effectivePort == "" {
@@ -143,84 +184,98 @@ func (r *uTLSHTTPRoundTripperImpl) getConn(addr string, alpnIsH2 bool) net.Conn 
 }
 
 func (r *uTLSHTTPRoundTripperImpl) dialOrGetTLSWithExpectedALPN(ctx context.Context, addr string, expectedH2 bool) (net.Conn, error) {
-	r.accessDialingConnection.Lock()
-	defer r.accessDialingConnection.Unlock()
-
-	if r.getShouldConnectWithH1(addr) == expectedH2 {
-		return nil, errEAGAIN
+	if conn, err := r.takePendingConn(addr, expectedH2); conn != nil || err != nil {
+		return conn, err
 	}
-
-	//Get a cached connection if possible to reduce preflight connection closed without sending data
-	if gconn := r.getConn(addr, expectedH2); gconn != nil {
-		return gconn, nil
-	}
-
+	// 拨号与握手在锁外进行，慢目标只影响自己
 	conn, err := r.dialTLS(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-
-	protocol := conn.ConnectionState().NegotiatedProtocol
-
-	protocolIsH2 := protocol == http2.NextProtoTLS
-
+	protocolIsH2 := conn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS
 	if protocolIsH2 == expectedH2 {
-		return conn, err
+		return conn, nil
 	}
+	r.stashConn(addr, protocolIsH2, conn)
+	return nil, errEAGAIN
+}
 
-	r.putConn(addr, protocolIsH2, conn)
+// takePendingConn 在锁内检查该地址的 ALPN 偏好并取出预拨的缓存连接，不做网络 I/O。
+func (r *uTLSHTTPRoundTripperImpl) takePendingConn(addr string, expectedH2 bool) (net.Conn, error) {
+	r.accessDialingConnection.Lock()
+	defer r.accessDialingConnection.Unlock()
+	if r.getShouldConnectWithH1(addr) == expectedH2 {
+		return nil, errEAGAIN
+	}
+	//Get a cached connection if possible to reduce preflight connection closed without sending data
+	return r.getConn(addr, expectedH2), nil
+}
 
-	if protocolIsH2 {
+// stashConn 缓存 ALPN 与预期不符的连接供另一种传输复用，并记录该地址的协议偏好。
+func (r *uTLSHTTPRoundTripperImpl) stashConn(addr string, isH2 bool, conn net.Conn) {
+	r.accessDialingConnection.Lock()
+	defer r.accessDialingConnection.Unlock()
+	r.putConn(addr, isH2, conn)
+	if isH2 {
 		r.clearShouldConnectWithH1(addr)
 	} else {
 		r.setShouldConnectWithH1(addr)
 	}
-
-	return nil, errEAGAIN
 }
 
 // based on https://repo.or.cz/dnstt.git/commitdiff/d92a791b6864901f9263f7d73d97cfd30ac53b09..98bdffa1706dfc041d1e99b86c47f29d72ad3a0c
 // by dcf1
 func (r *uTLSHTTPRoundTripperImpl) dialTLS(ctx context.Context, addr string) (*utls.UConn, error) {
-	config := r.config.Clone()
-
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	config.ServerName = host
-
-	systemDialer := &net.Dialer{}
-
-	var dialer proxy.ContextDialer
-	dialer = systemDialer
-
-	if r.proxyAddr != nil {
-		proxyDialer, err := proxy.FromURL(r.proxyAddr, systemDialer)
-		if err != nil {
-			return nil, err
-		}
-		dialer = proxyDialer.(proxy.ContextDialer)
+	dialer, err := r.contextDialer()
+	if err != nil {
+		return nil, err
 	}
-
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	uconn, err := r.newUClient(conn, host)
+	if err != nil {
+		return nil, err
+	}
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	if err := uconn.HandshakeContext(hctx); err != nil {
+		uconn.Close() // 原实现握手失败（如证书无效）时不关闭连接，泄漏 fd
+		return nil, err
+	}
+	return uconn, nil
+}
+
+// newUClient 以目标主机名构造 uTLS 客户端；目标为 IP 时去掉 SNI 扩展。
+func (r *uTLSHTTPRoundTripperImpl) newUClient(conn net.Conn, host string) (*utls.UConn, error) {
+	config := r.config.Clone()
+	config.ServerName = host
 	uconn := utls.UClient(conn, config, r.clientHelloID)
-	if net.ParseIP(config.ServerName) != nil {
-		err := uconn.RemoveSNIExtension()
-		if err != nil {
+	if net.ParseIP(host) != nil {
+		if err := uconn.RemoveSNIExtension(); err != nil {
 			uconn.Close()
 			return nil, err
 		}
 	}
+	return uconn, nil
+}
 
-	err = uconn.Handshake()
+// contextDialer 返回带连接超时的拨号器，配置了代理时经代理拨号。
+func (r *uTLSHTTPRoundTripperImpl) contextDialer() (proxy.ContextDialer, error) {
+	systemDialer := &net.Dialer{Timeout: dialTimeout}
+	if r.proxyAddr == nil {
+		return systemDialer, nil
+	}
+	proxyDialer, err := proxy.FromURL(r.proxyAddr, systemDialer)
 	if err != nil {
 		return nil, err
 	}
-	return uconn, nil
+	return proxyDialer.(proxy.ContextDialer), nil
 }
 
 func (r *uTLSHTTPRoundTripperImpl) init() {
@@ -228,16 +283,19 @@ func (r *uTLSHTTPRoundTripperImpl) init() {
 	max := 1 << 14
 
 	r.httpsH2Transport = &http2.Transport{
-		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-			return r.dialOrGetTLSWithExpectedALPN(context.Background(), addr, true)
+		// DialTLS（已弃用）拿不到请求 ctx，拨号无法随请求超时取消
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return r.dialOrGetTLSWithExpectedALPN(ctx, addr, true)
 		},
 		MaxReadFrameSize:          16384,
 		MaxDecoderHeaderTableSize: uint32(rand.Intn(max-min) + min),
+		IdleConnTimeout:           idleConnTimeout,
 	}
 	r.httpsH1Transport = &http.Transport{
 		DialTLSContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
 			return r.dialOrGetTLSWithExpectedALPN(ctx, addr, false)
 		},
+		IdleConnTimeout: idleConnTimeout,
 	}
 }
 

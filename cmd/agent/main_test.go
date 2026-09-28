@@ -32,3 +32,16 @@ func TestLookupIP(t *testing.T) {
 		t.Errorf("ResolveIPAddr failed: %v", err)
 	}
 }
+
+// 自定义 dns 时 ICMP/TCP 拨测也要走 net.DefaultResolver（已按 dns 配置拨号）。
+func TestProbeResolverHonorsDNSConfig(t *testing.T) {
+	defer func(old []string) { agentConfig.DNS = old }(agentConfig.DNS)
+	agentConfig.DNS = nil
+	if probeResolver() != dnsResolver {
+		t.Fatal("未配置 dns 时应使用系统 DNS")
+	}
+	agentConfig.DNS = []string{"1.1.1.1:53"}
+	if probeResolver() != net.DefaultResolver {
+		t.Fatal("配置 dns 后应使用 net.DefaultResolver")
+	}
+}

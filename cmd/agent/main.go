@@ -10,18 +10,15 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/nezhahq/service"
 	ping "github.com/prometheus-community/pro-bing"
 	utls "github.com/refraction-networking/utls"
 	"github.com/shirou/gopsutil/v4/host"
@@ -33,7 +30,6 @@ import (
 
 	"github.com/nezhahq/agent/cmd/agent/commands"
 	"github.com/nezhahq/agent/model"
-	"github.com/nezhahq/agent/pkg/fsnotifyx"
 	"github.com/nezhahq/agent/pkg/logger"
 	"github.com/nezhahq/agent/pkg/monitor"
 	"github.com/nezhahq/agent/pkg/util"
@@ -42,21 +38,26 @@ import (
 )
 
 var (
-	version               = monitor.Version // 来自于 GoReleaser 的版本号
-	arch                  string
-	executablePath        string
-	defaultConfigPath     = loadDefaultConfigPath()
-	client                pb.NezhaServiceClient
-	initialized           bool
-	agentConfig           model.AgentConfig
-	prevDashboardBootTime uint64 // 面板上次启动时间
-	geoipReported         bool   // 在面板重启后是否上报成功过 GeoIP
-	lastReportHostInfo    time.Time
-	lastReportIPInfo      time.Time
+	version           = monitor.Version // 来自于 GoReleaser 的版本号
+	arch              string
+	executablePath    string
+	defaultConfigPath = loadDefaultConfigPath()
+	agentConfig       model.AgentConfig
+
+	// 以下状态跨重连保留。重连前只在重连间隔内有限等待上一代守护协程退出，个别
+	// 卡住的旧协程（例如仍在 FetchIP）可能与新一代短暂并存，因此一律用原子量读写。
+	initialized           atomic.Bool
+	prevDashboardBootTime atomic.Uint64 // 面板上次启动时间
+	geoipReported         atomic.Bool   // 在面板重启后是否上报成功过 GeoIP
+	lastReportHostInfo    atomicTime
+	lastReportIPInfo      atomicTime
 
 	hostStatus atomic.Bool
 	ipStatus   atomic.Bool
 
+	insecureTLSWarnOnce sync.Once
+
+	// dnsResolver 使用系统 DNS（/etc/resolv.conf），供未自定义 dns 时的 ICMP/TCP 拨测解析内网域名
 	dnsResolver = &net.Resolver{PreferGo: true}
 	httpClient  = &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -79,6 +80,29 @@ const (
 	maxUpdateInterval = 2880
 
 	binaryName = "nezha-agent"
+
+	// maxConcurrentTasks 限制同时执行的任务数。每个 task 各起一个 goroutine，
+	// 不设上限时面板（或冒充面板的中间人）洪泛任务即可耗尽内存与 fd。
+	maxConcurrentTasks = 256
+	// maxProbeBodyBytes 拨测只关心时延与状态码，响应体最多读 1MiB，避免被当作下载放大器。
+	maxProbeBodyBytes = 1 << 20
+	// maxRecvMsgBytes 面板下发的消息（Task/回执/GeoIP）都很小；gRPC 默认允许单条 4MiB，
+	// 配合任务并发上限，恶意面板仍可让每个任务携带 4MiB 数据，这里收紧到 64KiB。
+	maxRecvMsgBytes = 64 << 10
+)
+
+var (
+	recvLimitOption = grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes))
+
+	taskSlots = make(chan struct{}, maxConcurrentTasks)
+	upgrading atomic.Bool // 强制更新单飞，重复下发的 Upgrade 直接忽略
+)
+
+// 流操作限时：超时即取消整个连接会话并重连。面板每 20 秒下发一次 Keepalive，
+// taskRecvTimeout 内收不到任何任务即视为连接已失活。声明为变量以便测试缩短。
+var (
+	taskRecvTimeout = time.Second * 30
+	reportTimeout   = time.Second * 10
 )
 
 func setEnv() {
@@ -126,29 +150,13 @@ func preRun(configPath string) error {
 	if configPath == "" {
 		configPath = defaultConfigPath
 	}
-
-	// windows环境处理
-	if runtime.GOOS == "windows" {
-		hostArch, err := host.KernelArch()
-		if err != nil {
-			return err
-		}
-		switch hostArch {
-		case "i386", "i686":
-			hostArch = "386"
-		case "x86_64":
-			hostArch = "amd64"
-		case "aarch64":
-			hostArch = "arm64"
-		}
-		if arch != hostArch {
-			return fmt.Errorf("与当前系统不匹配，当前运行 %s_%s, 需要下载 %s_%s", runtime.GOOS, arch, runtime.GOOS, hostArch)
-		}
+	if err := checkWindowsArch(); err != nil {
+		return err
 	}
-
 	if err := agentConfig.Read(configPath); err != nil {
 		return fmt.Errorf("init config failed: %v", err)
 	}
+	warnPlaintextTransport(&agentConfig)
 
 	monitor.InitConfig(&agentConfig)
 	monitor.CustomEndpoints = agentConfig.CustomIPApi
@@ -156,68 +164,107 @@ func preRun(configPath string) error {
 	return nil
 }
 
+// checkWindowsArch 仅 Windows：校验二进制 arch 与系统 arch 是否匹配。
+func checkWindowsArch() error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	hostArch, err := host.KernelArch()
+	if err != nil {
+		return err
+	}
+	switch hostArch {
+	case "i386", "i686":
+		hostArch = "386"
+	case "x86_64":
+		hostArch = "amd64"
+	case "aarch64":
+		hostArch = "arm64"
+	}
+	if arch != hostArch {
+		return fmt.Errorf("与当前系统不匹配，当前运行 %s_%s, 需要下载 %s_%s", runtime.GOOS, arch, runtime.GOOS, hostArch)
+	}
+	return nil
+}
+
+// warnPlaintextTransport tls=false 时 client_secret 以明文随每次 RPC 发送，中间人可截获
+// 并冒充面板下发任务（insecure_tls 的告警见 dialOptions）。用标准库 log 输出，
+// 确保非 debug 模式下也能看到；面板在本机回环地址时不告警。
+func warnPlaintextTransport(c *model.AgentConfig) {
+	if c.TLS {
+		return
+	}
+	host, _, _ := net.SplitHostPort(c.Server)
+	if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
+		return
+	}
+	log.Printf("警告: tls=false，client_secret 将以明文发送到 %s，中间人可截获并冒充面板；公网部署请启用 tls", c.Server)
+}
+
 func main() {
 	app := &cli.App{
-		Usage:   "哪吒监控 Agent",
-		Version: version,
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"},
-		},
-		Action: func(c *cli.Context) error {
-			if path := c.String("config"); path != "" {
-				if err := preRun(path); err != nil {
-					return err
-				}
-			} else {
-				if err := preRun(""); err != nil {
-					return err
-				}
-			}
-			runService("", "")
-			return nil
-		},
-		Commands: []*cli.Command{
-			{
-				Name:  "edit",
-				Usage: "编辑配置文件",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"},
-				},
-				Action: func(c *cli.Context) error {
-					if path := c.String("config"); path != "" {
-						commands.EditAgentConfig(path, &agentConfig)
-					} else {
-						commands.EditAgentConfig(defaultConfigPath, &agentConfig)
-					}
-					return nil
-				},
-			},
-			{
-				Name:      "service",
-				Usage:     "服务操作",
-				UsageText: "<install/uninstall/start/stop/restart>",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"},
-				},
-				Action: func(c *cli.Context) error {
-					if arg := c.Args().Get(0); arg != "" {
-						if path := c.String("config"); path != "" {
-							ap, _ := filepath.Abs(path)
-							runService(arg, ap)
-						} else {
-							ap, _ := filepath.Abs(defaultConfigPath)
-							runService(arg, ap)
-						}
-						return nil
-					}
-					return cli.Exit("必须指定一个参数", 1)
-				},
-			},
-		},
+		Usage:    "哪吒监控 Agent",
+		Version:  version,
+		Flags:    []cli.Flag{configFlag()},
+		Action:   runAction,
+		Commands: []*cli.Command{editCommand(), serviceCommand()},
 	}
-
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// configFlag 各命令共用的 -c/--config 参数。
+func configFlag() cli.Flag {
+	return &cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"}
+}
+
+// configPathOrDefault 返回 -c 指定的配置路径，留空时为二进制同目录的 config.yml。
+func configPathOrDefault(c *cli.Context) string {
+	if p := c.String("config"); p != "" {
+		return p
+	}
+	return defaultConfigPath
+}
+
+// runAction 默认动作：读取配置后以前台或服务模式运行 agent（preRun 自行处理空路径）。
+func runAction(c *cli.Context) error {
+	if err := preRun(c.String("config")); err != nil {
+		return err
+	}
+	runService("", "")
+	return nil
+}
+
+// editCommand 交互式编辑配置。
+func editCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "edit",
+		Usage: "编辑配置文件",
+		Flags: []cli.Flag{configFlag()},
+		Action: func(c *cli.Context) error {
+			commands.EditAgentConfig(configPathOrDefault(c), &agentConfig)
+			return nil
+		},
+	}
+}
+
+// serviceCommand 服务操作，配置路径转为绝对路径写入服务参数。
+func serviceCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "service",
+		Usage:     "服务操作",
+		UsageText: "<install/uninstall/start/stop/restart>",
+		Flags:     []cli.Flag{configFlag()},
+		Action: func(c *cli.Context) error {
+			action := c.Args().Get(0)
+			if action == "" {
+				return cli.Exit("必须指定一个参数", 1)
+			}
+			ap, _ := filepath.Abs(configPathOrDefault(c))
+			runService(action, ap)
+			return nil
+		},
 	}
 }
 
@@ -234,318 +281,83 @@ func run() {
 		},
 	}
 
-	// 定时检查更新
-	if _, err := semver.Parse(version); err == nil && !agentConfig.DisableAutoUpdate {
-		if doSelfUpdate(true) {
-			os.Exit(1)
-		}
-		go func() {
-			var interval time.Duration
-			if agentConfig.SelfUpdatePeriod > 0 {
-				interval = time.Duration(agentConfig.SelfUpdatePeriod) * time.Minute
-			} else {
-				interval = time.Duration(rand.Intn(maxUpdateInterval-minUpdateInterval)+minUpdateInterval) * time.Minute
-			}
-			for range time.Tick(interval) {
-				if doSelfUpdate(true) {
-					os.Exit(1)
-				}
-			}
-		}()
-	}
-
-	var err error
-	var dashboardBootTimeReceipt *pb.Uint64Receipt
-	var conn *grpc.ClientConn
-
-	retry := func() {
-		initialized = false
-		if conn != nil {
-			conn.Close()
-		}
-		time.Sleep(delayWhenError)
-		println("Try to reconnect ...")
-	}
+	startSelfUpdate()
 
 	for {
-		var securityOption grpc.DialOption
-		if agentConfig.TLS {
-			if agentConfig.InsecureTLS {
-				securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}))
-			} else {
-				securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
-			}
-		} else {
-			securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
-		}
-		conn, err = grpc.NewClient(agentConfig.Server, securityOption, grpc.WithPerRPCCredentials(&auth))
+		conn, err := grpc.NewClient(agentConfig.Server, dialOptions(&auth)...)
 		if err != nil {
 			printf("与面板建立连接失败: %v", err)
-			retry()
+			waitReconnect(nil, nil)
 			continue
 		}
-		client = pb.NewNezhaServiceClient(conn)
 		printf("Connection to %s established", agentConfig.Server)
-
-		timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
-		dashboardBootTimeReceipt, err = client.ReportSystemInfo2(timeOutCtx, monitor.GetHost().PB())
-		if err != nil {
-			printf("上报系统信息失败: %v", err)
-			cancel()
-			retry()
-			continue
-		}
-		cancel()
-
-		geoipReported = geoipReported && prevDashboardBootTime > 0 && dashboardBootTimeReceipt.GetData() == prevDashboardBootTime
-		prevDashboardBootTime = dashboardBootTimeReceipt.GetData()
-		initialized = true
-
-		wCtx, wCancel := context.WithCancel(context.Background())
-
-		// 执行 Task
-		tasks, err := doWithTimeout(func() (pb.NezhaService_RequestTaskClient, error) {
-			return client.RequestTask(wCtx)
-		}, networkTimeOut)
-		if err != nil {
-			printf("请求任务失败: %v", err)
-			wCancel()
-			retry()
-			continue
-		}
-		go receiveTasksDaemon(tasks, wCancel)
-
-		reportState, err := doWithTimeout(func() (pb.NezhaService_ReportSystemStateClient, error) {
-			return client.ReportSystemState(wCtx)
-		}, networkTimeOut)
-		if err != nil {
-			printf("上报状态信息失败: %v", err)
-			wCancel()
-			retry()
-			continue
-		}
-		go reportStateDaemon(reportState, wCancel)
-
-		<-wCtx.Done()
-		println("Worker exit...")
-
-		retry()
+		session := newAgentSession(pb.NewNezhaServiceClient(conn))
+		// 各步骤失败原因已在 serveConnection 内记录，这里只负责断开重连
+		_ = serveConnection(session)
+		waitReconnect(conn, session)
 	}
 }
 
-// systemdScriptWithCapNetRaw 复刻 kardianos/service 默认 systemd 模板，仅在
-// [Service] 段额外加入 AmbientCapabilities=CAP_NET_RAW，使以 nezha 低权限用户
-// 运行的 agent 仍能执行 ICMP 拨测（raw socket 需要该 capability）。capability
-// 写入 unit 文件，自更新覆写二进制不会丢失。
-const systemdScriptWithCapNetRaw = `[Unit]
-Description={{.Description}}
-ConditionFileIsExecutable={{.Path|cmdEscape}}
-{{range $i, $dep := .Dependencies}}
-{{$dep}} {{end}}
-
-[Service]
-StartLimitInterval=5
-StartLimitBurst=10
-ExecStart={{.Path|cmdEscape}}{{range .Arguments}} {{.|cmd}}{{end}}
-{{if .ChRoot}}RootDirectory={{.ChRoot|cmd}}{{end}}
-{{if .WorkingDirectory}}WorkingDirectory={{.WorkingDirectory|cmdEscape}}{{end}}
-{{if .UserName}}User={{.UserName}}{{end}}
-AmbientCapabilities=CAP_NET_RAW
-{{if .ReloadSignal}}ExecReload=/bin/kill -{{.ReloadSignal}} "$MAINPID"{{end}}
-{{if .PIDFile}}PIDFile={{.PIDFile|cmd}}{{end}}
-{{if and .LogOutput .HasOutputFileSupport -}}
-StandardOutput=file:{{.LogDirectory}}/{{.Name}}.out
-StandardError=file:{{.LogDirectory}}/{{.Name}}.err
-{{- end}}
-{{if gt .LimitNOFILE -1 }}LimitNOFILE={{.LimitNOFILE}}{{end}}
-{{if .Restart}}Restart={{.Restart}}{{end}}
-{{if .SuccessExitStatus}}SuccessExitStatus={{.SuccessExitStatus}}{{end}}
-RestartSec=30
-EnvironmentFile=-/etc/sysconfig/{{.Name}}
-
-{{range $k, $v := .EnvVars -}}
-Environment={{$k}}={{$v}}
-{{end -}}
-
-[Install]
-WantedBy=multi-user.target
-`
-
-// openRCScriptWithCapNetRaw 复刻 nezhahq/service 默认 OpenRC 模板，额外加入
-// command_user（以 nezha 低权限用户运行）与 capabilities="^cap_net_raw"（保留 ICMP
-// 拨测所需的 raw socket 能力，^ 前缀使其进入 ambient set 供子进程继承）。capability
-// 写入 service 脚本，自更新覆写二进制不会丢失。仅在使用 OpenRC 的发行版（如 Alpine）生效。
-const openRCScriptWithCapNetRaw = `#!/sbin/openrc-run
-supervisor=supervise-daemon
-name="{{.DisplayName}}"
-description="{{.Description}}"
-command={{.Path|cmdEscape}}
-{{- if .Arguments }}
-command_args="{{range .Arguments}}{{.}} {{end}}"
-{{- end }}
-name=$(basename $(readlink -f $command))
-{{if .WorkingDirectory}}directory="{{.WorkingDirectory}}"{{end}}
-{{if .UserName}}command_user="{{.UserName}}"{{end}}
-capabilities="^cap_net_raw"
-supervise_daemon_args="--stdout {{.LogDirectory}}/${name}.log --stderr {{.LogDirectory}}/${name}.err"
-
-{{range $k, $v := .EnvVars -}}
-export {{$k}}={{$v}}
-{{end -}}
-
-{{- if .Dependencies }}
-depend() {
-{{- range $i, $dep := .Dependencies}}
-{{"\t"}}{{$dep}}{{end}}
-}
-{{- end}}
-`
-
-func runService(action string, path string) {
-	svcOption := map[string]interface{}{
-		"OnFailure": "restart", // Windows 服务失败重启
-	}
-
-	args := []string{"-c", path}
-	name := filepath.Base(executablePath)
-	if path != defaultConfigPath && path != "" {
-		hex := util.MD5Sum(path)[:7]
-		name = fmt.Sprintf("%s-%s", name, hex)
-	}
-
-	svcConfig := &service.Config{
-		Name:             name,
-		DisplayName:      filepath.Base(executablePath),
-		Arguments:        args,
-		Description:      "哪吒监控 Agent",
-		WorkingDirectory: filepath.Dir(executablePath),
-		Option:           svcOption,
-	}
-
-	// 仅 Linux：以 nezha 低权限用户运行服务。kardianos/service 会据此在
-	// systemd unit 写入 User=nezha。非 Linux 平台保持原行为（不设 UserName）。
-	if runtime.GOOS == "linux" {
-		svcConfig.UserName = "nezha"
-		// systemd 与 OpenRC 模板均注入 CAP_NET_RAW，使低权限 nezha 用户仍可执行 ICMP
-		// 拨测。service 库按机器实际 init 系统自动择一，无需在此探测。
-		svcOption["SystemdScript"] = systemdScriptWithCapNetRaw
-		svcOption["OpenRCScript"] = openRCScriptWithCapNetRaw
-	}
-
-	prg := &commands.Program{
-		Exit: make(chan struct{}),
-		Run:  run,
-	}
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		printf("创建服务时出错，以普通模式运行: %v", err)
-		run()
+// startSelfUpdate 启动时检查一次更新，之后按 self_update_period（未配置则随机
+// 1~2 天）定时检查；更新成功即退出进程，由服务管理器以新版本拉起。
+func startSelfUpdate() {
+	if _, err := semver.Parse(version); err != nil || agentConfig.DisableAutoUpdate {
 		return
 	}
-	prg.Service = s
-
-	serviceLogger, err := logger.NewNezhaServiceLogger(s, nil)
-	if err != nil {
-		printf("获取 service logger 时出错: %+v", err)
-		logger.InitDefaultLogger(agentConfig.Debug, service.ConsoleLogger)
+	if doSelfUpdate(true) {
+		os.Exit(1)
+	}
+	var interval time.Duration
+	if agentConfig.SelfUpdatePeriod > 0 {
+		interval = time.Duration(agentConfig.SelfUpdatePeriod) * time.Minute
 	} else {
-		logger.InitDefaultLogger(agentConfig.Debug, serviceLogger)
+		interval = time.Duration(rand.Intn(maxUpdateInterval-minUpdateInterval)+minUpdateInterval) * time.Minute
 	}
-
-	if action == "install" {
-		initName := s.Platform()
-		if err := agentConfig.Read(path); err != nil {
-			log.Fatalf("init config failed: %v", err)
-		}
-		printf("Init system is: %s", initName)
-		// Linux 下在写入 systemd unit 前创建 nezha 用户，并把程序目录归属给
-		// nezha，使服务能以低权限运行的同时仍可自更新（覆盖写二进制）。
-		if runtime.GOOS == "linux" {
-			if err := ensureNezhaUser(); err != nil {
-				log.Fatalf("创建 nezha 用户失败: %v", err)
-			}
-			if err := chownAgentDir(); err != nil {
-				printf("chown 程序目录给 nezha 失败（自更新可能受影响）: %v", err)
+	go func() {
+		for range time.Tick(interval) {
+			if doSelfUpdate(true) {
+				os.Exit(1)
 			}
 		}
-	}
+	}()
+}
 
-	if len(action) != 0 {
-		err := service.Control(s, action)
-		if err != nil {
-			log.Fatal(err)
+// dialOptions 按配置构造传输安全与逐次调用鉴权选项。
+func dialOptions(auth *model.AuthHandler) []grpc.DialOption {
+	creds := insecure.NewCredentials()
+	if agentConfig.TLS {
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+		if agentConfig.InsecureTLS {
+			// 跳过证书校验会暴露于中间人攻击，仅应在可信内网或自签证书场景显式开启
+			insecureTLSWarnOnce.Do(func() {
+				log.Println("WARNING: TLS certificate verification is disabled (insecure_tls=true). Use only in trusted environments.")
+			})
+			tlsConfig.InsecureSkipVerify = true // #nosec G402 -- 用户显式开启 insecure_tls，已告警
 		}
-		return
+		creds = credentials.NewTLS(tlsConfig)
 	}
-
-	err = s.Run()
-	if err != nil {
-		logger.Error(err)
-	}
+	return []grpc.DialOption{grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(auth), recvLimitOption}
 }
 
-// ensureNezhaUser 仅 Linux。创建系统用户 nezha（无登录、无家目录），幂等。
-// install 需以 root 运行。优先用 GNU coreutils（useradd/groupadd，Debian/RHEL），
-// 不可用时回退到 busybox（addgroup/adduser，Alpine）。
-func ensureNezhaUser() error {
-	if _, err := user.Lookup("nezha"); err == nil {
-		return nil
+// waitReconnect 关闭旧连接，并在 delayWhenError 的重连间隔内等待上一代守护协程
+// 退出。关闭连接会让旧协程手上的流与 RPC 立即出错返回；个别仍卡在本地采集或
+// FetchIP 的旧协程等不到也不阻塞重连（跨代共享状态均为原子量）。
+func waitReconnect(conn *grpc.ClientConn, session *agentSession) {
+	deadline := time.Now().Add(delayWhenError)
+	initialized.Store(false)
+	if conn != nil {
+		conn.Close()
 	}
-	shell := nologinShell()
-	if err := addNezhaUserGNU(shell); err == nil {
-		return nil
+	if session != nil && !session.waitDaemons(delayWhenError) {
+		println("上一代守护协程仍未退出，继续重连")
 	}
-	if err := addNezhaUserBusybox(shell); err != nil {
-		return fmt.Errorf("创建 nezha 用户失败（useradd 与 adduser 均不可用）: %v", err)
-	}
-	return nil
+	time.Sleep(time.Until(deadline))
+	println("Try to reconnect ...")
 }
 
-// addNezhaUserGNU 用 GNU coreutils 创建 nezha 用户/组（Debian/RHEL 等）。
-func addNezhaUserGNU(shell string) error {
-	if _, err := exec.LookPath("useradd"); err != nil {
-		return err
-	}
-	_ = exec.Command("groupadd", "--system", "nezha").Run() // 已存在则忽略
-	out, err := exec.Command("useradd", "--system", "-g", "nezha",
-		"-M", "-s", shell, "nezha").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("useradd nezha: %v: %s", err, out)
-	}
-	return nil
-}
-
-// addNezhaUserBusybox 用 busybox 创建 nezha 系统用户/组（Alpine）。
-func addNezhaUserBusybox(shell string) error {
-	_ = exec.Command("addgroup", "-S", "nezha").Run() // 已存在则忽略
-	out, err := exec.Command("adduser", "-S", "-D", "-H",
-		"-G", "nezha", "-s", shell, "nezha").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("adduser nezha: %v: %s", err, out)
-	}
-	return nil
-}
-
-// nologinShell 返回当前系统可用的 nologin shell 路径（含 Alpine 的 /bin/false 兜底）。
-func nologinShell() string {
-	for _, shell := range []string{"/usr/sbin/nologin", "/sbin/nologin", "/bin/false"} {
-		if _, err := os.Stat(shell); err == nil {
-			return shell
-		}
-	}
-	return "/sbin/nologin"
-}
-
-// chownAgentDir 把程序目录（含二进制与配置）归属 nezha，保留自更新写权限。
-func chownAgentDir() error {
-	dir := filepath.Dir(executablePath)
-	return exec.Command("chown", "-R", "nezha:nezha", dir).Run()
-}
-
-// newSerialTaskResultSender wraps the RequestTask stream's Send with a mutex.
-// dispatchAgentTask runs most tasks in their own goroutine, and they all share
-// one stream; gRPC Go forbids concurrent SendMsg, so every result must funnel
-// through this serializer or overlapping MCP results corrupt the stream.
+// newSerialTaskResultSender 用互斥锁串行化 RequestTask 流的 Send。dispatchAgentTask
+// 为每个 task 起 goroutine，它们共享同一条流；gRPC Go 禁止并发 SendMsg，所有结果都
+// 必须经此串行化，否则并发的拨测结果会损坏流。
 func newSerialTaskResultSender(send func(*pb.TaskResult) error) func(*pb.TaskResult) error {
 	var mu sync.Mutex
 	return func(r *pb.TaskResult) error {
@@ -555,28 +367,44 @@ func newSerialTaskResultSender(send func(*pb.TaskResult) error) func(*pb.TaskRes
 	}
 }
 
-func receiveTasksDaemon(tasks pb.NezhaService_RequestTaskClient, cancel context.CancelFunc) {
-	var task *pb.Task
-	var err error
+// receiveTasksDaemon 循环接收面板任务。面板每 20 秒下发一次 Keepalive，超过
+// taskRecvTimeout 收不到任何任务即取消会话触发重连（与原 doWithTimeout 语义一致）。
+func receiveTasksDaemon(s *agentSession, tasks pb.NezhaService_RequestTaskClient) {
 	send := newSerialTaskResultSender(tasks.Send)
+	cancel := func() { s.cancel(errSendTaskResult) }
 	for {
-		task, err = doWithTimeout(func() (*pb.Task, error) {
-			return tasks.Recv()
-		}, time.Second*30)
+		task, err := callWithDeadline(s.cancel, taskRecvTimeout, tasks.Recv)
 		if err != nil {
 			printf("receiveTasks exit: %v", err)
-			cancel()
+			s.cancel(err)
 			return
 		}
 		dispatchAgentTask(task, send, cancel)
 	}
 }
 
-// dispatchAgentTask 一律以 goroutine 派发 task：拨测（HTTPGet/Ping）可能跑很久
-// 或永远不返回，不能阻塞接收循环。配置管理（ApplyConfig）原先需要同步处理的
-// 特殊路径已随热重载机制一并移除。
+// dispatchAgentTask 以 goroutine 派发 task：拨测（HTTPGet/Ping）可能跑很久，
+// 不能阻塞接收循环。并发数受 taskSlots 限制；满载时在接收循环内同步回复失败，
+// 既不再新起 goroutine，也对洪泛方形成背压。
 func dispatchAgentTask(task *pb.Task, send func(*pb.TaskResult) error, cancel context.CancelFunc) {
-	go runAgentTask(task, send, cancel)
+	select {
+	case taskSlots <- struct{}{}:
+		go func() {
+			defer func() { <-taskSlots }()
+			runAgentTask(task, send, cancel)
+		}()
+	default:
+		rejectAgentTask(task, send, cancel)
+	}
+}
+
+// rejectAgentTask 并发已满时回复失败结果（面板对 Keepalive/Upgrade 结果不做处理）。
+func rejectAgentTask(task *pb.Task, send func(*pb.TaskResult) error, cancel context.CancelFunc) {
+	result := &pb.TaskResult{Id: task.GetId(), Type: task.GetType(), Data: "agent busy: too many concurrent tasks"}
+	if err := send(result); err != nil {
+		printf("send task result exit: %v", err)
+		cancel()
+	}
 }
 
 func runAgentTask(task *pb.Task, send func(*pb.TaskResult) error, cancel context.CancelFunc) {
@@ -617,190 +445,118 @@ func doTask(task *pb.Task) *pb.TaskResult {
 }
 
 // reportStateDaemon 向server上报状态信息
-func reportStateDaemon(stateClient pb.NezhaService_ReportSystemStateClient, cancel context.CancelFunc) {
-	var err error
+func reportStateDaemon(s *agentSession, stream pb.NezhaService_ReportSystemStateClient) {
 	for {
-		lastReportHostInfo, lastReportIPInfo, err = reportState(stateClient, lastReportHostInfo, lastReportIPInfo)
-		if err != nil {
+		if err := reportState(s, stream); err != nil {
 			printf("reportStateDaemon exit: %v", err)
-			cancel()
+			s.cancel(err)
 			return
 		}
-		time.Sleep(time.Second * time.Duration(agentConfig.ReportDelay))
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(time.Second * time.Duration(agentConfig.ReportDelay)):
+		}
 	}
 }
 
-func reportState(statClient pb.NezhaService_ReportSystemStateClient, host, ip time.Time) (time.Time, time.Time, error) {
-	if statClient.Context().Err() != nil {
-		return host, ip, statClient.Context().Err()
+func reportState(s *agentSession, stream pb.NezhaService_ReportSystemStateClient) error {
+	if err := stream.Context().Err(); err != nil {
+		return err
 	}
-	if initialized {
-		monitor.TrackNetworkSpeed()
-		if _, err := doWithTimeout(func() (*pb.Receipt, error) {
-			return nil, statClient.Send(monitor.GetState(agentConfig.SkipConnectionCount, agentConfig.SkipProcsCount).PB())
-		}, time.Second*10); err != nil {
-			return host, ip, err
-		}
-		_, err := doWithTimeout(statClient.Recv, time.Second*10)
-		if err != nil {
-			return host, ip, err
+	if initialized.Load() {
+		if err := sendState(s, stream); err != nil {
+			return err
 		}
 	}
 	// 每10分钟重新获取一次硬件信息
-	if host.Before(time.Now().Add(-10 * time.Minute)) {
-		if reportHost() {
-			host = time.Now()
-		}
+	if lastReportHostInfo.Load().Before(time.Now().Add(-10*time.Minute)) && reportHost(s) {
+		lastReportHostInfo.Store(time.Now())
 	}
-	// 更新IP信息
-	if time.Since(ip) > time.Second*time.Duration(agentConfig.IPReportPeriod) || !geoipReported {
-		if reportGeoIP(agentConfig.UseIPv6CountryCode, !geoipReported) {
-			ip = time.Now()
-			geoipReported = true
-		}
-	}
-	return host, ip, nil
+	reportGeoIPIfDue(s)
+	return nil
 }
 
-func reportHost() bool {
+// sendState 采集并推送一次状态；推送与等待回执各限时 reportTimeout，超时取消会话。
+// 采集本身不计入限时：本地采集变慢不应被当成连接失活。
+func sendState(s *agentSession, stream pb.NezhaService_ReportSystemStateClient) error {
+	monitor.TrackNetworkSpeed()
+	state := monitor.GetState(agentConfig.SkipConnectionCount, agentConfig.SkipProcsCount).PB()
+	if _, err := callWithDeadline(s.cancel, reportTimeout, func() (struct{}, error) {
+		return struct{}{}, stream.Send(state)
+	}); err != nil {
+		return err
+	}
+	_, err := callWithDeadline(s.cancel, reportTimeout, stream.Recv)
+	return err
+}
+
+// reportGeoIPIfDue 到达 ip_report_period，或面板重启后尚未上报过时更新 GeoIP。
+func reportGeoIPIfDue(s *agentSession) {
+	reported := geoipReported.Load()
+	if reported && time.Since(lastReportIPInfo.Load()) <= time.Second*time.Duration(agentConfig.IPReportPeriod) {
+		return
+	}
+	if reportGeoIP(s, agentConfig.UseIPv6CountryCode, !reported) {
+		lastReportIPInfo.Store(time.Now())
+		geoipReported.Store(true)
+	}
+}
+
+func reportHost(s *agentSession) bool {
 	if !hostStatus.CompareAndSwap(false, true) {
 		return false
 	}
 	defer hostStatus.Store(false)
-	if client != nil && initialized {
-		receipt, err := doWithTimeout(func() (*pb.Uint64Receipt, error) {
-			return client.ReportSystemInfo2(context.Background(), monitor.GetHost().PB())
-		}, time.Second*10)
-		if err != nil {
-			printf("ReportSystemInfo2 error: %v", err)
-			return false
-		}
-		geoipReported = geoipReported && prevDashboardBootTime > 0 && receipt.GetData() == prevDashboardBootTime
+	if !initialized.Load() {
+		return true
 	}
+	// 超时 ctx 派生自会话 ctx：会话取消即中止 RPC，不再遗留超时后仍在跑的孤儿调用
+	ctx, cancel := context.WithTimeout(s.ctx, reportTimeout)
+	defer cancel()
+	receipt, err := s.client.ReportSystemInfo2(ctx, monitor.GetHost().PB())
+	if err != nil {
+		printf("ReportSystemInfo2 error: %v", err)
+		return false
+	}
+	prevBootTime := prevDashboardBootTime.Load()
+	geoipReported.Store(geoipReported.Load() && prevBootTime > 0 && receipt.GetData() == prevBootTime)
 	return true
 }
 
-func reportGeoIP(use6, forceUpdate bool) bool {
+// reportGeoIP 的 monitor.GeoQueryIP* 等状态只在 ipStatus 互斥区内读写，无需额外加锁。
+func reportGeoIP(s *agentSession, use6, forceUpdate bool) bool {
 	if !ipStatus.CompareAndSwap(false, true) {
 		return false
 	}
 	defer ipStatus.Store(false)
-
-	if client == nil || !initialized {
+	if !initialized.Load() {
 		return false
 	}
-
 	pbg := monitor.FetchIP(use6)
 	if pbg == nil {
 		return false
 	}
-
 	if !monitor.GeoQueryIPChanged && !forceUpdate {
 		return true
 	}
-
-	geoip, err := doWithTimeout(func() (*pb.GeoIP, error) {
-		return client.ReportGeoIP(context.Background(), pbg)
-	}, time.Second*10)
+	ctx, cancel := context.WithTimeout(s.ctx, reportTimeout)
+	defer cancel()
+	geoip, err := s.client.ReportGeoIP(ctx, pbg)
 	if err != nil {
 		return false
 	}
-
-	prevDashboardBootTime = geoip.GetDashboardBootTime()
-
+	prevDashboardBootTime.Store(geoip.GetDashboardBootTime())
 	monitor.CachedCountryCode = geoip.GetCountryCode()
 	monitor.GeoQueryIPChanged = false
-
 	return true
 }
 
-// doSelfUpdate 执行更新检查 如果更新成功则会结束进程
-func doSelfUpdate(useLocalVersion bool) (exit bool) {
-	v := semver.MustParse("0.1.0")
-	if useLocalVersion {
-		vr, err := semver.Parse(version)
-		if err != nil {
-			printf("failed to parse current version string: %v", err)
-			return
-		}
-		cmd := exec.Command(executablePath, "--version")
-		vb, err := cmd.Output()
-		if err != nil {
-			printf("failed to retrieve current executable version: %v", err)
-			return
-		}
-		vraw := strings.Split(strings.TrimSpace(string(vb)), " ")
-		vstr := vraw[len(vraw)-1]
-		v, err = semver.Parse(vstr)
-		if err != nil {
-			printf("failed to parse executable version string: %v", err)
-			return
-		}
-		if !vr.Equals(v) {
-			printf("executable version differs from current version, exiting to re-check update...")
-			exit = true
-			return
-		}
-	}
-
-	execHash := util.MD5Sum(executablePath)[:7]
-	statName := fmt.Sprintf("agent-%s.stat", execHash)
-	tmpDir := filepath.Join(os.TempDir(), binaryName)
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		printf("failed to create temp dir: %v", err)
-		return
-	}
-
-	statFile := filepath.Join(tmpDir, statName)
-	if _, err := os.Stat(statFile); err == nil {
-		printf("found self-update stat file, waiting for another process to finish update...")
-		if fErr := fsnotifyx.ExitOnDeleteFile(context.Background(), printf, statFile); fErr != nil {
-			if errors.Is(fErr, fsnotifyx.ErrTimeout) {
-				os.Remove(statFile) // try to remove stat file
-			}
-			printf("failed to monitor path of stat file: %v", fErr)
-			return
-		}
-		exit = true
-		return
-	} else {
-		if !errors.Is(err, os.ErrNotExist) {
-			printf("failed to retrieve self-update stat at %s", statFile)
-			return
-		}
-	}
-
-	stat, err := os.OpenFile(statFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		printf("failed to create self-update stat file: %v", err)
-		return
-	}
-
-	defer func() {
-		stat.Close()
-		if err := os.Remove(statFile); err != nil {
-			printf("remove stat failed: %v", err)
-		}
-	}()
-
-	printf("检查更新: %v", v)
-	latest, err := updateFromSource("wangdefaa/nezha-agent", v)
-	if err != nil {
-		printf("更新失败: %v", err)
-		return
-	}
-
-	if !latest.Version.Equals(v) {
-		printf("已经更新至: %v, 正在结束进程", latest.Version)
-		exit = true
-	}
-	return
-}
-
 func handleUpgradeTask(*pb.Task, *pb.TaskResult) {
-	if agentConfig.DisableForceUpdate {
+	if agentConfig.DisableForceUpdate || !upgrading.CompareAndSwap(false, true) {
 		return
 	}
+	defer upgrading.Store(false)
 	if doSelfUpdate(false) {
 		os.Exit(1)
 	}
@@ -840,31 +596,38 @@ func handleIcmpPingTask(task *pb.Task, result *pb.TaskResult) {
 		result.Data = "This server has disabled query sending"
 		return
 	}
-
 	ipAddr, err := lookupIP(task.GetData())
 	printf("ICMP-Ping Task: Pinging %s(%s)", task.GetData(), ipAddr)
 	if err != nil {
 		result.Data = err.Error()
 		return
 	}
-	pinger, err := ping.NewPinger(ipAddr)
-	if err == nil {
-		pinger.SetPrivileged(true)
-		pinger.Count = 5
-		pinger.Timeout = time.Second * 20
-		err = pinger.Run() // Blocks until finished.
-	}
-	if err == nil {
-		stat := pinger.Statistics()
-		if stat.PacketsRecv == 0 {
-			result.Data = "pockets recv 0"
-			return
-		}
-		result.Delay = float32(stat.AvgRtt.Microseconds()) / 1000.0
-		result.Successful = true
-	} else {
+	stat, err := runPinger(ipAddr)
+	if err != nil {
 		result.Data = err.Error()
+		return
 	}
+	if stat.PacketsRecv == 0 {
+		result.Data = "packets recv 0"
+		return
+	}
+	result.Delay = float32(stat.AvgRtt.Microseconds()) / 1000.0
+	result.Successful = true
+}
+
+// runPinger 以特权模式（raw socket，需 CAP_NET_RAW）发 5 个 ICMP 包，总超时 20s。
+func runPinger(ipAddr string) (*ping.Statistics, error) {
+	pinger, err := ping.NewPinger(ipAddr)
+	if err != nil {
+		return nil, err
+	}
+	pinger.SetPrivileged(true)
+	pinger.Count = 5
+	pinger.Timeout = time.Second * 20
+	if err := pinger.Run(); err != nil { // Blocks until finished.
+		return nil, err
+	}
+	return pinger.Statistics(), nil
 }
 
 func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
@@ -872,37 +635,61 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 		result.Data = "This server has disabled query sending"
 		return
 	}
-	start := time.Now()
 	taskUrl := task.GetData()
-	resp, err := httpClient.Get(taskUrl)
+	if !isHTTPURL(taskUrl) {
+		result.Data = "invalid URL: only http and https schemes are supported"
+		return
+	}
 	printf("HTTP-GET Task: %s", taskUrl)
-	if err == nil {
-		defer resp.Body.Close()
-		_, err = io.Copy(io.Discard, resp.Body)
-	}
-	if err == nil {
-		// 检查 HTTP Response 状态
-		result.Delay = float32(time.Since(start).Microseconds()) / 1000.0
-		if resp.StatusCode > 399 || resp.StatusCode < 200 {
-			err = errors.New("\n应用错误: " + resp.Status)
-		}
-	}
-	if err == nil {
-		// 检查 SSL 证书信息
-		if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-			c := resp.TLS.PeerCertificates[0]
-			result.Data = c.Issuer.CommonName + "|" + c.NotAfter.String()
-		}
-		result.Successful = true
-	} else {
+	certSummary, delay, err := httpGetProbe(taskUrl)
+	result.Delay = delay
+	if err != nil {
 		// HTTP 请求失败
 		result.Data = err.Error()
+		return
 	}
+	// SSL 证书信息
+	result.Data = certSummary
+	result.Successful = true
+}
+
+// httpGetProbe 发起 GET 并读取响应体（至多 maxProbeBodyBytes），返回证书摘要与耗时
+// （毫秒）；状态码不在 200~399 视为应用错误，此时仍返回耗时。
+func httpGetProbe(taskUrl string) (string, float32, error) {
+	start := time.Now()
+	resp, err := httpClient.Get(taskUrl)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBodyBytes)); err != nil {
+		return "", 0, err
+	}
+	delay := float32(time.Since(start).Microseconds()) / 1000.0
+	if resp.StatusCode > 399 || resp.StatusCode < 200 {
+		return "", delay, errors.New("\n应用错误: " + resp.Status)
+	}
+	return tlsCertSummary(resp), delay, nil
+}
+
+// isHTTPURL 仅放行 http/https，拨测目标来自面板下发，拒绝其它 scheme（对齐上游 CodeQL 修复）。
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https")
+}
+
+// tlsCertSummary 返回首张证书的签发者与到期时间（"Issuer|NotAfter"），非 TLS 响应返回空串。
+func tlsCertSummary(resp *http.Response) string {
+	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
+		return ""
+	}
+	c := resp.TLS.PeerCertificates[0]
+	return c.Issuer.CommonName + "|" + c.NotAfter.String()
 }
 
 func lookupIP(hostOrIp string) (string, error) {
 	if net.ParseIP(hostOrIp) == nil {
-		ips, err := dnsResolver.LookupIPAddr(context.Background(), hostOrIp)
+		ips, err := probeResolver().LookupIPAddr(context.Background(), hostOrIp)
 		if err != nil {
 			return "", err
 		}
@@ -914,18 +701,11 @@ func lookupIP(hostOrIp string) (string, error) {
 	return hostOrIp, nil
 }
 
-func doWithTimeout[T any](fn func() (T, error), timeout time.Duration) (T, error) {
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	var t T
-	var err error
-	go func() {
-		defer cancel()
-		t, err = fn()
-	}()
-	<-timeoutCtx.Done()
-	if timeoutCtx.Err() != context.Canceled {
-		return t, fmt.Errorf("context error: %v, fn err: %v", timeoutCtx.Err(), err)
+// probeResolver 配置了 dns 时用 net.DefaultResolver（setEnv 已令其只拨这些服务器），
+// 否则沿用系统 DNS。原实现 ICMP/TCP 拨测恒用 dnsResolver，自定义 dns 对其不生效。
+func probeResolver() *net.Resolver {
+	if len(agentConfig.DNS) > 0 {
+		return net.DefaultResolver
 	}
-	return t, err
+	return dnsResolver
 }

@@ -69,13 +69,3 @@ func (h *Host) PB() *pb.Host {
 		Version:         h.Version,
 	}
 }
-
-type GeoIP struct {
-	IP          IP     `json:"ip,omitempty"`
-	CountryCode string `json:"country_code,omitempty"`
-}
-
-type IP struct {
-	IPv4Addr string `json:"ipv4_addr,omitempty"`
-	IPv6Addr string `json:"ipv6_addr,omitempty"`
-}

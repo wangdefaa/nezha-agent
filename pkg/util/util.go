@@ -1,24 +1,19 @@
 package util
 
 import (
-	"cmp"
 	"context"
 	"crypto/md5"
 	"fmt"
 	"iter"
 	"net"
 	"net/http"
-	"os"
-	"slices"
 	"strings"
 	"time"
 )
 
+// MacOSChromeUA 拨测与公网 IP 查询使用的 UA。名称为历史遗留，实际取值是 agent 自身标识；
+// 上游测试直接引用此名，暂不改名。
 const MacOSChromeUA = "nezha-agent/1.0"
-
-func IsWindows() bool {
-	return os.PathSeparator == '\\' && os.PathListSeparator == ';'
-}
 
 func BrowserHeaders() http.Header {
 	return http.Header{
@@ -37,16 +32,6 @@ func ContainsStr(slice []string, str string) bool {
 		}
 	}
 	return false
-}
-
-func RemoveDuplicate[S ~[]E, E cmp.Ordered](list S) S {
-	if list == nil {
-		return nil
-	}
-	out := make([]E, len(list))
-	copy(out, list)
-	slices.Sort(out)
-	return slices.Compact(out)
 }
 
 func RotateQueue1(start, i, size int) int {

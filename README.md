@@ -24,7 +24,9 @@ $env:NZ_SERVER="面板IP:8008"; $env:NZ_CLIENT_SECRET="你的密钥"
 iwr -useb https://raw.githubusercontent.com/wangdefaa/nezha-agent/main/script/install.ps1 | iex
 ```
 
-`NZ_CLIENT_SECRET` 需与面板的 `agent_secret_key` 一致。Docker 部署见 [docker-compose.yaml](docker-compose.yaml)(采集宿主机指标需开启 host 网络与 PID 命名空间)。
+`NZ_CLIENT_SECRET` 需与面板的 `agent_secret_key` 一致;面板经 TLS 反代暴露时加 `NZ_TLS=true`;直连面板的明文端口时,密钥会以明文传输,只适合内网。安装脚本会校验发布包:Linux / macOS 用内置公钥验签(需要 `openssl`),Windows 核对 `checksums.txt`。Docker 部署见 [docker-compose.yaml](docker-compose.yaml)(采集宿主机指标需开启 host 网络与 PID 命名空间)。
+
+预编译平台:Linux amd64 / arm64 / armv6+、macOS amd64 / arm64、Windows amd64 / arm64。其它架构(386、riscv64、mips、s390x 等)请从源码构建:`CGO_ENABLED=0 go build ./cmd/agent`。
 
 ## 命令
 

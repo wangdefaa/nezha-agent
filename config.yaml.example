@@ -5,7 +5,7 @@
 
 server: localhost:8008          # Dashboard 地址 host:port(与 gRPC 复用同端口)
 client_secret: ""               # 必填:需与 Dashboard 的 agent_secret_key 一致
-uuid: ""                        # 留空时首次连接由面板分配并写回
+uuid: ""                        # 留空时 agent 首次启动本地生成并写回(配置只读挂载时请手动填写)
 tls: false                      # 与面板通信是否启用 TLS(面板在反代后启用 https 时设 true)
 insecure_tls: false             # 跳过 TLS 证书校验(自签证书时使用)
 
